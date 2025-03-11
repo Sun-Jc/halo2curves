@@ -8,3 +8,5 @@ Cargo.lock
 # script generated source code
 src/bn256/fr/table.rs
 
+*.csv
+*.ipynb

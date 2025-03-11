@@ -8,7 +8,7 @@ use rayon::iter::{
 
 use crate::CurveAffine;
 
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 32;
 
 fn get_booth_index(window_index: usize, window_size: usize, el: &[u8]) -> i32 {
     // Booth encoding:
@@ -458,87 +458,9 @@ pub fn msm_parallel<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cur
     }
 }
 
-/// This function will panic if coeffs and bases have a different length.
-///
-/// This will use multithreading if beneficial.
-#[inline]
-pub fn msm_best<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
-    assert_eq!(coeffs.len(), bases.len());
-
-    // TODO: consider adjusting it with empirical data?
-    let c = if bases.len() < 4 {
-        1
-    } else if bases.len() < 32 {
-        3
-    } else {
-        (f64::from(bases.len() as u32)).ln().ceil() as usize
-    };
-
-    if c < 10 {
-        return msm_parallel(coeffs, bases);
-    }
-
-    // coeffs to byte representation
-    let coeffs: Vec<_> = coeffs.par_iter().map(|a| a.to_repr()).collect();
-    // copy bases into `Affine` to skip in on curve check for every access
-    let bases_local: Vec<_> = bases.par_iter().map(Affine::from).collect();
-
-    // number of windows
-    let number_of_windows = C::Scalar::NUM_BITS as usize / c + 1;
-    // accumumator for each window
-    let mut acc = vec![C::Curve::identity(); number_of_windows];
-    acc.par_iter_mut().enumerate().rev().for_each(|(w, acc)| {
-        // jacobian buckets for already scheduled points
-        let mut j_bucks = vec![Bucket::<C>::None; 1 << (c - 1)];
-
-        // schedular for affine addition
-        let mut sched = Schedule::new(c);
-
-        for (base_idx, coeff) in coeffs.iter().enumerate() {
-            let buck_idx = get_booth_index(w, c, coeff.as_ref());
-
-            if buck_idx != 0 {
-                // parse bucket index
-                let sign = buck_idx.is_positive();
-                let buck_idx = buck_idx.unsigned_abs() as usize - 1;
-
-                if sched.contains(buck_idx) {
-                    // greedy accumulation
-                    // we use original bases here
-                    j_bucks[buck_idx].add_assign(&bases[base_idx], sign);
-                } else {
-                    // also flushes the schedule if full
-                    sched.add(&bases_local, base_idx, buck_idx, sign);
-                }
-            }
-        }
-
-        // flush the schedule
-        sched.execute(&bases_local);
-
-        // summation by parts
-        // e.g. 3a + 2b + 1c = a +
-        //                    (a) + b +
-        //                    ((a) + b) + c
-        let mut running_sum = C::Curve::identity();
-        for (j_buck, a_buck) in j_bucks.iter().zip(sched.buckets.iter()).rev() {
-            running_sum += j_buck.add(a_buck);
-            *acc += running_sum;
-        }
-
-        // shift accumulator to the window position
-        for _ in 0..c * w {
-            *acc = acc.double();
-        }
-    });
-    acc.into_iter().sum::<_>()
-}
 
 #[inline]
-pub fn msm_best2<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
-where
-    C::Scalar: PrimeField<Repr = crate::serde::Repr<32>>,
-{
+pub fn msm_best2<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve where C::Scalar: PrimeField<Repr=crate::serde::Repr<32>> {
     assert_eq!(coeffs.len(), bases.len());
 
     // TODO: consider adjusting it with empirical data?
@@ -557,15 +479,12 @@ where
     // coeffs to byte representation
     // let coeffs: Vec<_> = coeffs.par_iter().map(|a| a.to_repr()).collect();
 
-    let coeffs = coeffs
-        .par_iter()
-        .map(|a| {
-            let a = a.to_repr();
-            let mut coeff = [0; 3];
-            coeff.copy_from_slice(&a[..3]);
-            coeff
-        })
-        .collect::<Vec<_>>();
+    let coeffs = coeffs.par_iter().map(|a| {
+        let a = a.to_repr();
+        let mut coeff = [0; 3];
+        coeff.copy_from_slice(&a[..3]);
+        coeff
+    }).collect::<Vec<_>>();
 
     // copy bases into `Affine` to skip in on curve check for every access
     let bases_local: Vec<_> = bases.par_iter().map(Affine::from).collect();

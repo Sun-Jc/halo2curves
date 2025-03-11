@@ -4,6 +4,7 @@ pub mod ff_ext;
 pub mod fft;
 pub mod hash_to_curve;
 pub mod msm;
+pub mod msm2;
 pub mod serde;
 
 pub mod bls12381;
