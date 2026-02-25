@@ -273,6 +273,9 @@ struct Schedule<C: CurveAffine> {
     buckets: Vec<BucketAffine<C>>,
     set: [SchedulePoint; BATCH_SIZE],
     ptr: usize,
+    /// Bitmap for O(1) `contains` check: `bitmap[buck_idx]` is true iff
+    /// `buck_idx` appears in the current batch `set[..ptr]`.
+    bitmap: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,20 +303,25 @@ impl<C: CurveAffine> Schedule<C> {
             .try_into()
             .unwrap();
 
+        let num_buckets = 1 << (c - 1);
         Self {
-            buckets: vec![BucketAffine::None; 1 << (c - 1)],
+            buckets: vec![BucketAffine::None; num_buckets],
             set,
             ptr: 0,
+            bitmap: vec![false; num_buckets],
         }
     }
 
     fn contains(&self, buck_idx: usize) -> bool {
-        self.set.iter().any(|sch| sch.buck_idx == buck_idx)
+        self.bitmap[buck_idx]
     }
 
     fn execute(&mut self, bases: &[Affine<C>]) {
         if self.ptr != 0 {
             batch_add(self.ptr, &mut self.buckets, &self.set, bases);
+            for i in 0..self.ptr {
+                self.bitmap[self.set[i].buck_idx] = false;
+            }
             self.ptr = 0;
             self.set
                 .iter_mut()
@@ -324,11 +332,56 @@ impl<C: CurveAffine> Schedule<C> {
     fn add(&mut self, bases: &[Affine<C>], base_idx: usize, buck_idx: usize, sign: bool) {
         if !self.buckets[buck_idx].assign(&bases[base_idx], sign) {
             self.set[self.ptr] = SchedulePoint::new(base_idx, buck_idx, sign);
+            self.bitmap[buck_idx] = true;
             self.ptr += 1;
         }
 
         if self.ptr == self.set.len() {
             self.execute(bases);
+        }
+    }
+}
+
+/// Compute the optimal Pippenger window size `c` for `n` scalars.
+///
+/// Uses `⌈ln(n)⌉` as base, with empirical offsets tuned per size range.
+/// Benchmarked on Apple M4 Pro with 4 threads (BN254, 256-bit scalars):
+///   k=14 (n=16384):    optimal c=10 (= base)
+///   k=16 (n=65536):    optimal c=13 (= base+1)
+///   k=18 (n=262144):   optimal c=13 (= base)
+///   k=20 (n=1048576):  optimal c=16 (= base+2)
+///   k=22 (n=4194304):  optimal c=16 (= base)
+///   k=24 (n=16777216): optimal c=16 (= base-1)
+///   k=26 (n=67108864): optimal c=22 (= base+3)
+fn get_optimal_c(n: usize) -> usize {
+    if n < 4 {
+        1
+    } else if n < 32 {
+        3
+    } else {
+        let base = log(f64::from(n as u32)).ceil() as usize;
+        if n > 33554432 {
+            // k >= 26: fewer windows wins over bucket cache pressure.
+            // At k=26 (67M points, 2M buckets), c=22 gives only 12 windows
+            // and each bucket averages ~32 points, amortizing cache misses.
+            base + 3
+        } else if n > 1048576 {
+            // k=21..25: c=16 is consistently optimal across this range.
+            // At k=22, c=16 and c=17 are within noise; c=16 is safer.
+            // At k=24, base=17 but c=16 wins (fewer buckets = less cache pressure).
+            16
+        } else if n > 262144 {
+            // k=19..20: base+2 (k=19 → c=16, k=20 → c=16)
+            base + 2
+        } else if n > 131072 {
+            // k=18: base=13, which is optimal (c=14 doubles bucket count for
+            // only 1 fewer window — not worth the cache pressure at 262K points).
+            base
+        } else if n > 16384 {
+            // k=15..17: base+1 (e.g., k=16 → c=13, k=17 → c=13)
+            base + 1
+        } else {
+            base
         }
     }
 }
@@ -339,13 +392,7 @@ impl<C: CurveAffine> Schedule<C> {
 pub fn msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], acc: &mut C::Curve) {
     let coeffs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
 
-    let c = if bases.len() < 4 {
-        1
-    } else if bases.len() < 32 {
-        3
-    } else {
-        log(f64::from(bases.len() as u32)).ceil() as usize
-    };
+    let c = get_optimal_c(bases.len());
 
     let field_byte_size = C::Scalar::NUM_BITS.div_ceil(8u32) as usize;
     // OR all coefficients in order to make a mask to figure out the maximum number
@@ -469,14 +516,7 @@ pub fn msm_parallel<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cur
 pub fn msm_best<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     assert_eq!(coeffs.len(), bases.len());
 
-    // TODO: consider adjusting it with empirical data?
-    let c = if bases.len() < 4 {
-        1
-    } else if bases.len() < 32 {
-        3
-    } else {
-        log(f64::from(bases.len() as u32)).ceil() as usize
-    };
+    let c = get_optimal_c(bases.len());
 
     #[cfg(feature = "std")]
     if c < 10 {
