@@ -13,7 +13,7 @@ use plonky2_maybe_rayon::*;
 
 const BATCH_SIZE: usize = 64;
 
-fn get_booth_index(window_index: usize, window_size: usize, el: &[u8]) -> i32 {
+pub(crate) fn get_booth_index(window_index: usize, window_size: usize, el: &[u8]) -> i32 {
     // Booth encoding:
     // * step by `window` size
     // * slice by size of `window + 1``
@@ -353,7 +353,7 @@ impl<C: CurveAffine> Schedule<C> {
 ///   k=22 (n=4194304):  optimal c=16 (= base)
 ///   k=24 (n=16777216): optimal c=16 (= base-1)
 ///   k=26 (n=67108864): optimal c=22 (= base+3)
-fn get_optimal_c(n: usize) -> usize {
+pub(crate) fn get_optimal_c(n: usize) -> usize {
     if n < 4 {
         1
     } else if n < 32 {

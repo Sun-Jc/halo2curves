@@ -14,9 +14,11 @@ extern crate criterion;
 
 use std::time::SystemTime;
 
-use criterion::{BenchmarkId, Criterion};
+use criterion::{measurement::WallTime, BenchmarkId, Criterion};
 use ff::{Field, PrimeField};
 use group::prime::PrimeCurveAffine;
+#[cfg(feature = "gpu")]
+use halo2curves::gpu::msm_gpu;
 use halo2curves::{
     bn256::{Fr as Scalar, G1Affine as Point},
     msm::{msm_best, msm_serial},
@@ -27,10 +29,11 @@ use rayon::{
     current_thread_index,
     prelude::{IntoParallelIterator, ParallelIterator},
 };
+use std::time::Duration;
 
 const SAMPLE_SIZE: usize = 10;
 const SINGLECORE_RANGE: [u8; 6] = [3, 8, 10, 12, 14, 16];
-const MULTICORE_RANGE: [u8; 9] = [3, 8, 10, 12, 14, 16, 18, 20, 22];
+const MULTICORE_RANGE: [u8; 11] = [3, 8, 10, 12, 14, 16, 18, 20, 22, 24, 25];
 const SEED: [u8; 16] = [
     0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06, 0xbc, 0xe5,
 ];
@@ -156,6 +159,32 @@ fn msm(c: &mut Criterion) {
                     })
                 })
                 .sample_size(SAMPLE_SIZE);
+        }
+        #[cfg(feature = "gpu")]
+        for k in MULTICORE_RANGE {
+            if k < 14 {
+                continue;
+            } // GPU only useful for large inputs
+            let id = format!("{b}b_{k}");
+            group
+                .bench_function(BenchmarkId::new("gpu", id), |b| {
+                    assert!(k < 64);
+                    let n: usize = 1 << k;
+                    b.iter(|| {
+                        msm_gpu(&coeffs[b_index][..n], &bases[..n]);
+                    })
+                })
+                .sample_size(if k >= 24 { 10 } else { SAMPLE_SIZE })
+                .warm_up_time(if k >= 24 {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(3)
+                })
+                .measurement_time(if k >= 24 {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(5)
+                });
         }
     }
     group.finish();

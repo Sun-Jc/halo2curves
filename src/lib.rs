@@ -18,6 +18,9 @@ pub mod secp256r1;
 pub mod secq256k1;
 pub mod t256;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 #[macro_use]
 mod derive;
 
