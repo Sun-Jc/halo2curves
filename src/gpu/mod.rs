@@ -425,12 +425,13 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
 
     // 6. PBPR or CPU reduction
     //    Use PBPR whenever we have enough buckets for at least 2 threads with bpt >= 2.
-    //    At num_buckets=4096: ideal threads = 4096/64 = 64, bpt = 64 — fine for PBPR.
     let use_pbpr = num_buckets >= 256;
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
             .max_total_threads_per_threadgroup() as usize;
-        let ideal = (num_buckets / 64).max(2).min(max_tg);
+        // Aim for ~8 buckets per thread: good parallelism without starving threads
+        let ideal = (num_buckets / 8).min(max_tg).max(1);
+        // Round down to power of 2 for even division
         let mut t = 1;
         while t * 2 <= ideal && num_buckets % (t * 2) == 0 { t *= 2; }
         t
@@ -800,7 +801,7 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
             .max_total_threads_per_threadgroup() as usize;
-        let ideal = (num_buckets / 64).max(2).min(max_tg);
+        let ideal = (num_buckets / 8).min(max_tg).max(1);
         let mut t = 1;
         while t * 2 <= ideal && num_buckets % (t * 2) == 0 { t *= 2; }
         t
@@ -1060,19 +1061,10 @@ fn build_scatter_table(
 
 /// Optimal Pippenger window size for GPU.
 ///
-/// GPU prefers larger windows (fewer dispatches) because:
-/// 1. Bucket accumulation is GPU-parallel (more buckets = more parallelism)
-/// 2. Fewer windows = fewer kernel launches (each has fixed overhead)
-/// 3. PBPR handles the larger bucket count efficiently on GPU
-///
-/// Tuned based on zkmopro's empirical values and icicle's ARM decision tree.
+/// Uses the same empirically-tuned heuristic as the CPU MSM.
+/// Larger c = more buckets = more GPU threads, but also more memory.
+/// The CPU heuristic was validated against the GPU's all-windows-in-one-dispatch
+/// architecture and found to produce equivalent or better results.
 fn get_optimal_c_gpu(n: usize) -> usize {
-    let k = (n as f64).log2() as usize;
-    match k {
-        0..=13  => 10,
-        14..=17 => 13,
-        18..=21 => 15,
-        22..=24 => 16,
-        _       => 18,
-    }
+    crate::msm::get_optimal_c(n)
 }
