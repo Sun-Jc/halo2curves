@@ -3,39 +3,20 @@ name = "msm-bench"
 version = "0.1.0"
 edition = "2021"
 
-[[bench]]
-name = "msm_compare"
-harness = false
-
 [dependencies]
-# arkworks (local path)
-ark-ec = { path = "../arkworks-algebra/ec", default-features = false, features = ["parallel"] }
-ark-ff = { path = "../arkworks-algebra/ff", default-features = false, features = ["std"] }
-ark-std = { version = "0.5.0", features = ["std"] }
-ark-serialize = { path = "../arkworks-algebra/serialize", default-features = false }
-ark-bn254 = { path = "../arkworks-algebra/curves/bn254", features = ["curve", "scalar_field"] }
+# halo2curves — optimized (opt/msm-fast branch on Sun-Jc fork, v0.9.1)
+halo2curves = { git = "https://github.com/Sun-Jc/halo2curves.git", branch = "opt/msm-fast", features = ["std"] }
+# halo2curves — baseline (upstream main branch, v0.9.0)
+halo2curves_baseline = { git = "https://github.com/privacy-scaling-explorations/halo2curves.git", branch = "main", package = "halo2curves", features = ["std"] }
 
-# halo2curves — optimized (local opt/bitmap-window branch)
-halo2curves = { path = "../halo2curves", features = ["std"] }
-# halo2curves — baseline (local main branch via worktree)
-halo2curves_baseline = { path = "../halo2curves-main", package = "halo2curves", features = ["std"] }
 ff = "0.13"
 group = "0.13"
-
-# bench tooling
-criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.8"
 
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[profile.bench]
+[profile.release]
 opt-level = 3
 debug = false
 lto = "thin"
 incremental = false
 codegen-units = 1
-
-[patch.crates-io]
-ark-bn254 = { path = "../arkworks-algebra/curves/bn254", features = ["curve", "scalar_field"] }
