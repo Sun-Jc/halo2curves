@@ -15,8 +15,10 @@ ark-std = { version = "0.5.0", features = ["std"] }
 ark-serialize = { path = "../arkworks-algebra/serialize", default-features = false }
 ark-bn254 = { path = "../arkworks-algebra/curves/bn254", features = ["curve", "scalar_field"] }
 
-# halo2curves (local path)
+# halo2curves — optimized (local opt/bitmap-window branch)
 halo2curves = { path = "../halo2curves", features = ["std"] }
+# halo2curves — baseline (local main branch via worktree)
+halo2curves_baseline = { path = "../halo2curves-main", package = "halo2curves", features = ["std"] }
 ff = "0.13"
 group = "0.13"
 

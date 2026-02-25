@@ -458,12 +458,12 @@ dependencies = [
 
 [[package]]
 name = "halo2curves"
-version = "0.9.0"
+version = "0.9.0-baseline"
 dependencies = [
  "digest",
  "ff",
  "group",
- "halo2derive",
+ "halo2derive 0.2.0-baseline",
  "lazy_static",
  "libm",
  "num-bigint",
@@ -477,6 +477,41 @@ dependencies = [
  "sha2",
  "static_assertions",
  "subtle",
+]
+
+[[package]]
+name = "halo2curves"
+version = "0.9.0"
+dependencies = [
+ "digest",
+ "ff",
+ "group",
+ "halo2derive 0.2.0",
+ "lazy_static",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "pairing",
+ "paste",
+ "plonky2_maybe_rayon",
+ "rand_core",
+ "rayon",
+ "sha2",
+ "static_assertions",
+ "subtle",
+]
+
+[[package]]
+name = "halo2derive"
+version = "0.2.0-baseline"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -590,7 +625,8 @@ dependencies = [
  "criterion",
  "ff",
  "group",
- "halo2curves",
+ "halo2curves 0.9.0",
+ "halo2curves 0.9.0-baseline",
  "rand_core",
  "rayon",
 ]
