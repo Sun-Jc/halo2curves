@@ -233,11 +233,8 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     assert_eq!(coeffs.len(), bases.len());
 
     let n = bases.len();
-    let k = (n as f64).log2() as usize;
     let mut timing = GpuMsmTiming::default();
     timing.n = n;
-
-    eprintln!("[msm_gpu] n={n} (k={k})");
 
     // Fall back for small inputs where GPU overhead dominates
     if n < (1 << 14) {
@@ -249,15 +246,10 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
 
     let total_start = Instant::now();
     let ctx = gpu_ctx();
-    let max_buf_len = ctx.device.max_buffer_length();
-    eprintln!("[msm_gpu] Metal device: {}, max_buffer_length: {} bytes ({:.2} GB)",
-        ctx.device.name(), max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64);
     let c = get_optimal_c_gpu(n);
     let num_buckets = 1usize << (c - 1);
     timing.c = c;
     timing.num_buckets = num_buckets;
-
-    eprintln!("[msm_gpu] c={c}, num_buckets={num_buckets}");
 
     // 1. Serialize scalars to bytes (parallelized with rayon)
     let t0 = Instant::now();
@@ -269,16 +261,6 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     assert_eq!(std::mem::size_of::<G1Affine>(), 64,
         "G1Affine must be 64 bytes for zero-copy GPU transfer");
     let bases_byte_len = n * std::mem::size_of::<G1Affine>();
-    eprintln!("[msm_gpu] bases_buf: {} bytes ({:.2} GB), max_allowed: {} bytes ({:.2} GB){}",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64,
-        if (bases_byte_len as u64) > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    assert!(
-        (bases_byte_len as u64) <= max_buf_len,
-        "msm_gpu: bases_buf ({} bytes = {:.2} GB) exceeds Metal max_buffer_length ({} bytes = {:.2} GB) at n={n} (k={k})",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64,
-    );
     let bases_buf = ctx.device.new_buffer(
         bases_byte_len as u64,
         MTLResourceOptions::StorageModeShared,
@@ -323,50 +305,36 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     let total_offsets = num_active * (num_buckets + 1);
     let total_bucket_slots = num_active * num_buckets;
 
-    // Diagnostic: compute and log all buffer sizes before allocating
     let scatter_buf_bytes = (total_scatter_entries.max(1) * 4) as u64;
     let offsets_buf_bytes = (total_offsets.max(1) * 4) as u64;
     let buckets_buf_bytes = (total_bucket_slots.max(1) * 24 * 4) as u64;
     let params_buf_bytes  = (num_active.max(1) * 3 * 4) as u64;
-    let total_gpu_bytes = (bases_byte_len as u64) + scatter_buf_bytes + offsets_buf_bytes + buckets_buf_bytes + params_buf_bytes;
 
-    eprintln!("[msm_gpu] num_windows={number_of_windows}, active_windows={num_active}, total_scatter_entries={total_scatter_entries}");
-    eprintln!("[msm_gpu] Buffer sizes:");
-    eprintln!("[msm_gpu]   bases_buf:   {:>12} bytes ({:.3} GB){}",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        if (bases_byte_len as u64) > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu]   scatter_buf: {:>12} bytes ({:.3} GB){}",
-        scatter_buf_bytes, scatter_buf_bytes as f64 / (1u64 << 30) as f64,
-        if scatter_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu]   offsets_buf: {:>12} bytes ({:.3} GB){}",
-        offsets_buf_bytes, offsets_buf_bytes as f64 / (1u64 << 30) as f64,
-        if offsets_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu]   buckets_buf: {:>12} bytes ({:.3} GB){}",
-        buckets_buf_bytes, buckets_buf_bytes as f64 / (1u64 << 30) as f64,
-        if buckets_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu]   params_buf:  {:>12} bytes",
-        params_buf_bytes);
-    eprintln!("[msm_gpu]   TOTAL GPU:   {:>12} bytes ({:.3} GB)",
-        total_gpu_bytes, total_gpu_bytes as f64 / (1u64 << 30) as f64);
-
-    // Check scatter_cursor u32 overflow risk
-    if total_scatter_entries > u32::MAX as usize {
-        eprintln!("[msm_gpu] *** FATAL: total_scatter_entries ({total_scatter_entries}) exceeds u32::MAX! ***");
+    // Diagnostic logging only when timed (avoids hot-path overhead)
+    if timed {
+        let max_buf_len = ctx.device.max_buffer_length();
+        let total_gpu_bytes = (bases_byte_len as u64) + scatter_buf_bytes + offsets_buf_bytes + buckets_buf_bytes + params_buf_bytes;
+        let k = (n as f64).log2() as usize;
+        eprintln!("[msm_gpu] n={n} (k={k}), c={c}, num_buckets={num_buckets}");
+        eprintln!("[msm_gpu] Metal max_buffer_length: {:.2} GB", max_buf_len as f64 / (1u64 << 30) as f64);
+        eprintln!("[msm_gpu] windows={number_of_windows}, active={num_active}, scatter_entries={total_scatter_entries}");
+        eprintln!("[msm_gpu] Buffers: bases={:.3}GB scatter={:.3}GB offsets={:.3}GB buckets={:.3}GB TOTAL={:.3}GB",
+            bases_byte_len as f64 / (1u64 << 30) as f64,
+            scatter_buf_bytes as f64 / (1u64 << 30) as f64,
+            offsets_buf_bytes as f64 / (1u64 << 30) as f64,
+            buckets_buf_bytes as f64 / (1u64 << 30) as f64,
+            total_gpu_bytes as f64 / (1u64 << 30) as f64);
+        for (name, size) in [("bases_buf", bases_byte_len as u64), ("scatter_buf", scatter_buf_bytes), ("buckets_buf", buckets_buf_bytes)] {
+            if size > max_buf_len {
+                eprintln!("[msm_gpu] *** {name} ({:.2} GB) EXCEEDS Metal limit ({:.2} GB) ***",
+                    size as f64 / (1u64 << 30) as f64, max_buf_len as f64 / (1u64 << 30) as f64);
+            }
+        }
     }
 
-    // Check each buffer against Metal limit BEFORE allocating
-    for (name, size) in [
-        ("scatter_buf", scatter_buf_bytes),
-        ("offsets_buf", offsets_buf_bytes),
-        ("buckets_buf", buckets_buf_bytes),
-    ] {
-        assert!(
-            size <= max_buf_len,
-            "msm_gpu: {name} ({size} bytes = {:.2} GB) exceeds Metal max_buffer_length ({max_buf_len} bytes = {:.2} GB) at n={n} (k={k})",
-            size as f64 / (1u64 << 30) as f64,
-            max_buf_len as f64 / (1u64 << 30) as f64,
-        );
-    }
+    // Debug-only safety checks (compiled out in release builds)
+    debug_assert!(total_scatter_entries <= u32::MAX as usize,
+        "msm_gpu: total_scatter_entries ({total_scatter_entries}) exceeds u32::MAX");
 
     // Allocate Metal buffers directly — write scatter/offsets data straight into
     // shared memory, avoiding intermediate Vec allocations + double-copy.
@@ -637,18 +605,12 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     assert_eq!(coeffs.len(), bases.len());
 
     let n = bases.len();
-    let k = (n as f64).log2() as usize;
-
-    eprintln!("[msm_gpu_glv] n={n} (k={k})");
 
     if n < (1 << 14) {
         return crate::msm::msm_best(coeffs, bases);
     }
 
     let ctx = gpu_ctx();
-    let max_buf_len = ctx.device.max_buffer_length();
-    eprintln!("[msm_gpu_glv] Metal device: {}, max_buffer_length: {} bytes ({:.2} GB)",
-        ctx.device.name(), max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64);
 
     // 1. GLV scalar decomposition: k = k1 + lambda * k2
     //    decompose_scalar returns (|k1|, k1_neg, |k2|, k2_neg) with k1,k2 ~128 bits
@@ -679,16 +641,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let zeta = <Fq as WithSmallOrderMulGroup<3>>::ZETA;
     let total_points = 2 * n;
     let bases_byte_len = total_points * 16 * 4; // 16 u32s per affine point
-    eprintln!("[msm_gpu_glv] bases_buf (2n): {} bytes ({:.2} GB), max_allowed: {} bytes ({:.2} GB){}",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64,
-        if (bases_byte_len as u64) > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    assert!(
-        (bases_byte_len as u64) <= max_buf_len,
-        "msm_gpu_glv: bases_buf ({} bytes = {:.2} GB) exceeds Metal max_buffer_length ({} bytes = {:.2} GB) at n={n} (k={k})",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        max_buf_len, max_buf_len as f64 / (1u64 << 30) as f64,
-    );
     let bases_buf = ctx.device.new_buffer(
         bases_byte_len as u64,
         MTLResourceOptions::StorageModeShared,
@@ -730,8 +682,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let num_buckets = 1usize << (c - 1);
     let number_of_windows = half_bits / c + 1;
 
-    eprintln!("[msm_gpu_glv] c={c}, num_buckets={num_buckets}, num_windows={number_of_windows}, half_bits={half_bits}");
-
     // 4. Build ALL scatter tables in parallel
     let scatter_tables: Vec<_> = (0..number_of_windows)
         .into_par_iter()
@@ -757,55 +707,16 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let total_offsets = num_active * (num_buckets + 1);
     let total_bucket_slots = num_active * num_buckets;
 
-    // Diagnostic: compute and log all buffer sizes before allocating
     let scatter_buf_bytes = (total_scatter_entries.max(1) * 4) as u64;
     let offsets_buf_bytes = (total_offsets.max(1) * 4) as u64;
     let buckets_buf_bytes = (total_bucket_slots.max(1) * 24 * 4) as u64;
     let params_buf_bytes  = (num_active.max(1) * 3 * 4) as u64;
-    let total_gpu_bytes = (bases_byte_len as u64) + scatter_buf_bytes + offsets_buf_bytes + buckets_buf_bytes + params_buf_bytes;
 
-    eprintln!("[msm_gpu_glv] active_windows={num_active}, total_scatter_entries={total_scatter_entries}");
-    eprintln!("[msm_gpu_glv] Buffer sizes:");
-    eprintln!("[msm_gpu_glv]   bases_buf:   {:>12} bytes ({:.3} GB){}",
-        bases_byte_len, bases_byte_len as f64 / (1u64 << 30) as f64,
-        if (bases_byte_len as u64) > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu_glv]   scatter_buf: {:>12} bytes ({:.3} GB){}",
-        scatter_buf_bytes, scatter_buf_bytes as f64 / (1u64 << 30) as f64,
-        if scatter_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu_glv]   offsets_buf: {:>12} bytes ({:.3} GB){}",
-        offsets_buf_bytes, offsets_buf_bytes as f64 / (1u64 << 30) as f64,
-        if offsets_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu_glv]   buckets_buf: {:>12} bytes ({:.3} GB){}",
-        buckets_buf_bytes, buckets_buf_bytes as f64 / (1u64 << 30) as f64,
-        if buckets_buf_bytes > max_buf_len { " *** EXCEEDS LIMIT ***" } else { "" });
-    eprintln!("[msm_gpu_glv]   params_buf:  {:>12} bytes",
-        params_buf_bytes);
-    eprintln!("[msm_gpu_glv]   TOTAL GPU:   {:>12} bytes ({:.3} GB)",
-        total_gpu_bytes, total_gpu_bytes as f64 / (1u64 << 30) as f64);
-
-    // Check scatter_cursor u32 overflow risk
-    if total_scatter_entries > u32::MAX as usize {
-        eprintln!("[msm_gpu_glv] *** FATAL: total_scatter_entries ({total_scatter_entries}) exceeds u32::MAX! ***");
-    }
-
-    // Check base_idx overflow risk in GLV scatter entries: (n + i) must fit in 31 bits
-    if (2 * n) > (1u32 << 31) as usize {
-        eprintln!("[msm_gpu_glv] *** FATAL: 2*n ({}) exceeds u31 range for base_idx packing! ***", 2 * n);
-    }
-
-    // Check each buffer against Metal limit BEFORE allocating
-    for (name, size) in [
-        ("scatter_buf", scatter_buf_bytes),
-        ("offsets_buf", offsets_buf_bytes),
-        ("buckets_buf", buckets_buf_bytes),
-    ] {
-        assert!(
-            size <= max_buf_len,
-            "msm_gpu_glv: {name} ({size} bytes = {:.2} GB) exceeds Metal max_buffer_length ({max_buf_len} bytes = {:.2} GB) at n={n} (k={k})",
-            size as f64 / (1u64 << 30) as f64,
-            max_buf_len as f64 / (1u64 << 30) as f64,
-        );
-    }
+    // Debug-only safety checks (compiled out in release builds)
+    debug_assert!(total_scatter_entries <= u32::MAX as usize,
+        "msm_gpu_glv: total_scatter_entries exceeds u32::MAX");
+    debug_assert!((2 * n) <= (1usize << 31),
+        "msm_gpu_glv: 2*n exceeds u31 range for base_idx packing");
 
     // Allocate Metal buffers directly — write scatter/offsets data straight into
     // shared memory, avoiding intermediate Vec allocations + double-copy.
