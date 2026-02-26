@@ -442,15 +442,69 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         }
     });
 
-    // Meanwhile: scalar encode + scatter build on rayon pool
+    // Meanwhile: fused scalar encode + scatter build on rayon pool
+    //
+    // Instead of separate encode and scatter phases, we fuse them:
+    // 1. Compute to_repr() once per scalar (in parallel)
+    // 2. Extract ALL windows' Booth indices from the repr
+    // 3. Store as column-major i16 booth[window][scalar] for sequential scatter access
+    //
+    // This eliminates the 512MB intermediate coeffs_bytes allocation.
     let t0 = Instant::now();
-    let coeffs_bytes: Vec<_> = coeffs.par_iter().map(|s| s.to_repr()).collect();
+
+    let booth = {
+        let mut booth = vec![0i16; number_of_windows * n];
+        let booth_addr = booth.as_mut_ptr() as usize;
+
+        coeffs.par_iter().enumerate().for_each(|(i, s)| {
+            let bytes = s.to_repr();
+            let ptr = booth_addr as *mut i16;
+            for w in 0..number_of_windows {
+                let idx = get_booth_index(w, c, bytes.as_ref());
+                // SAFETY: each scalar i writes to distinct positions [w*n + i].
+                unsafe { *ptr.add(w * n + i) = idx as i16; }
+            }
+        });
+        booth
+    };
     if timed { timing.scalar_encode_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     let t0 = Instant::now();
     let scatter_tables: Vec<_> = (0..number_of_windows)
         .into_par_iter()
-        .map(|w| build_scatter_table(w, c, num_buckets, &coeffs_bytes))
+        .map(|w| {
+            let booth_slice = &booth[w * n..(w + 1) * n];
+
+            // Pass 1: count
+            let mut counts = vec![0u32; num_buckets];
+            for &idx in booth_slice {
+                if idx != 0 {
+                    counts[idx.unsigned_abs() as usize - 1] += 1;
+                }
+            }
+
+            // Prefix-sum
+            let mut bucket_offsets = vec![0u32; num_buckets + 1];
+            for b in 0..num_buckets {
+                bucket_offsets[b + 1] = bucket_offsets[b] + counts[b];
+            }
+            let total = bucket_offsets[num_buckets] as usize;
+
+            // Pass 2: fill
+            let mut scatter_entries = vec![0u32; total];
+            let mut write_pos = bucket_offsets[..num_buckets].to_vec();
+            for (i, &idx) in booth_slice.iter().enumerate() {
+                if idx != 0 {
+                    let sign = (idx > 0) as u32;
+                    let buck = idx.unsigned_abs() as usize - 1;
+                    let pos = write_pos[buck] as usize;
+                    scatter_entries[pos] = (i as u32) | (sign << 31);
+                    write_pos[buck] += 1;
+                }
+            }
+
+            (bucket_offsets, scatter_entries)
+        })
         .collect();
     if timed { timing.scatter_build_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
@@ -1098,6 +1152,96 @@ fn build_scatter_table(
     }
 
     (bucket_offsets, scatter_entries)
+}
+
+/// Build CSR scatter tables for all windows.
+///
+/// Fused encode+scatter: converts each scalar to bytes once, extracts all
+/// windows' Booth indices, and stores in column-major layout [window][scalar]
+/// as i16. Then each window builds its scatter table from the precomputed
+/// i16 array with sequential access.
+///
+/// Reduces total memory bandwidth vs the original approach:
+/// - Original: N×32B encode + W×N×32B scatter = N×32B×(W+1)
+/// - Fused: N×32B encode+extract + W×N×2B scatter = N×(32B + W×2B)
+/// For k=24, c=16: 512MB + 537MB = 1049MB vs original 8.5GB (8× reduction).
+fn build_scatter_tables_fused(
+    c: usize,
+    num_buckets: usize,
+    number_of_windows: usize,
+    coeffs_bytes: &[impl AsRef<[u8]> + Sync],
+) -> Vec<(Vec<u32>, Vec<u32>)> {
+    use rayon::prelude::*;
+
+    let n = coeffs_bytes.len();
+    if n == 0 {
+        return (0..number_of_windows)
+            .map(|_| (vec![0u32; num_buckets + 1], Vec::new()))
+            .collect();
+    }
+
+    // ─── Phase 1: Extract Booth indices (column-major) ────────────────
+    // Layout: booth[w * n + i] = Booth index for window w, scalar i.
+    // Column-major so Phase 2 has sequential access per window.
+    let mut booth = vec![0i16; number_of_windows * n];
+
+    // Parallel extraction: each scalar writes to indices [w*n + i] for all w.
+    // Writes to different columns (i) don't conflict.
+    let booth_addr = booth.as_mut_ptr() as usize;
+    coeffs_bytes
+        .par_iter()
+        .enumerate()
+        .for_each(|(i, coeff)| {
+            let bytes = coeff.as_ref();
+            let ptr = booth_addr as *mut i16;
+            for w in 0..number_of_windows {
+                let idx = get_booth_index(w, c, bytes);
+                // SAFETY: each scalar i writes to distinct positions [w*n + i]
+                // across all windows. No two scalars share the same position.
+                unsafe {
+                    *ptr.add(w * n + i) = idx as i16;
+                }
+            }
+        });
+
+    // ─── Phase 2: Build scatter tables from precomputed i16 arrays ────
+    // Each window gets a contiguous [n]-length i16 slice → sequential access.
+    (0..number_of_windows)
+        .into_par_iter()
+        .map(|w| {
+            let booth_slice = &booth[w * n..(w + 1) * n];
+
+            // Pass 1: count
+            let mut counts = vec![0u32; num_buckets];
+            for &idx in booth_slice {
+                if idx != 0 {
+                    counts[idx.unsigned_abs() as usize - 1] += 1;
+                }
+            }
+
+            // Prefix-sum
+            let mut bucket_offsets = vec![0u32; num_buckets + 1];
+            for b in 0..num_buckets {
+                bucket_offsets[b + 1] = bucket_offsets[b] + counts[b];
+            }
+            let total = bucket_offsets[num_buckets] as usize;
+
+            // Pass 2: fill
+            let mut scatter_entries = vec![0u32; total];
+            let mut write_pos = bucket_offsets[..num_buckets].to_vec();
+            for (i, &idx) in booth_slice.iter().enumerate() {
+                if idx != 0 {
+                    let sign = (idx > 0) as u32;
+                    let buck = idx.unsigned_abs() as usize - 1;
+                    let pos = write_pos[buck] as usize;
+                    scatter_entries[pos] = (i as u32) | (sign << 31);
+                    write_pos[buck] += 1;
+                }
+            }
+
+            (bucket_offsets, scatter_entries)
+        })
+        .collect()
 }
 
 /// Optimal Pippenger window size for GPU.

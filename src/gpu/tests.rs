@@ -714,3 +714,34 @@ fn test_msm_gpu_glv_correctness() {
         eprintln!("✅ msm_gpu_glv matches msm_best at k={} (n={})", k, n);
     }
 }
+
+/// Timing breakdown test — prints per-phase times for GPU MSM.
+/// Run with: cargo test --features gpu --release -- test_msm_gpu_timing --nocapture --ignored
+#[test]
+#[ignore]
+fn test_msm_gpu_timing() {
+    for k in [14, 18, 20, 22, 24] {
+        let n = 1usize << k;
+        let scalars: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+        let points_proj: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+        let mut points = vec![G1Affine::identity(); n];
+        G1::batch_normalize(&points_proj, &mut points);
+
+        let (_result, timing) = crate::gpu::msm_gpu_timed(&scalars, &points);
+        eprintln!("k={k:2} | n={n:>10} | c={c} | windows={w} | \
+                   encode={enc:.1}ms scatter={scat:.1}ms base_pack={bp:.1}ms \
+                   gpu_upload={up:.1}ms gpu_kernel={gk:.1}ms gpu_reduce={gr:.1}ms \
+                   cpu_reduce={cr:.1}ms | total={tot:.1}ms",
+            c = timing.c,
+            w = timing.num_windows,
+            enc = timing.scalar_encode_ms,
+            scat = timing.scatter_build_ms,
+            bp = timing.base_pack_ms,
+            up = timing.gpu_upload_ms,
+            gk = timing.gpu_kernel_ms,
+            gr = timing.gpu_reduce_ms,
+            cr = timing.cpu_reduce_ms,
+            tot = timing.total_ms,
+        );
+    }
+}
