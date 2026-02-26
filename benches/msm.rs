@@ -8,13 +8,18 @@
 //! Caveat:  The multicore benchmark assumes:
 //!     1. a multi-core system
 //!     2. that the `multicore` feature is enabled.  It is by default.
+//!
+//! Base points are cached in /tmp/halo2_msm_bases_k{K}.bin as raw bytes
+//! to avoid expensive regeneration on every run.
 
 #[macro_use]
 extern crate criterion;
 
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
-use criterion::{measurement::WallTime, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion};
 use ff::{Field, PrimeField};
 use group::prime::PrimeCurveAffine;
 #[cfg(feature = "gpu")]
@@ -33,10 +38,75 @@ use std::time::Duration;
 
 const SAMPLE_SIZE: usize = 10;
 const SINGLECORE_RANGE: [u8; 6] = [3, 8, 10, 12, 14, 16];
-const MULTICORE_RANGE: [u8; 11] = [3, 8, 10, 12, 14, 16, 18, 20, 22, 24, 25];
+const MULTICORE_RANGE: [u8; 10] = [3, 8, 10, 12, 14, 16, 18, 20, 22, 24];
 const SEED: [u8; 16] = [
     0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06, 0xbc, 0xe5,
 ];
+
+// ── Raw binary cache for base points ────────────────────────────────────────
+//
+// Format:  [magic: 8 bytes][n: 8 bytes (u64 LE)][points: n * size_of::<Point>() bytes]
+// Points are stored as raw memory (Montgomery-form [u64;4] × 2 per G1Affine).
+// No per-element serialization — single read()/write() syscall.
+
+const CACHE_MAGIC: [u8; 8] = *b"H2CPTS01";
+
+fn cache_path(k: u8) -> PathBuf {
+    PathBuf::from(format!("/tmp/halo2_msm_bases_k{}.bin", k))
+}
+
+fn load_cached_points(k: u8) -> Option<Vec<Point>> {
+    let path = cache_path(k);
+    let mut file = std::fs::File::open(&path).ok()?;
+
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).ok()?;
+    if &header[..8] != &CACHE_MAGIC {
+        return None;
+    }
+    let n = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+    if n != (1usize << k) {
+        return None;
+    }
+
+    let byte_len = n * std::mem::size_of::<Point>();
+    let mut points = vec![Point::identity(); n];
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(points.as_mut_ptr() as *mut u8, byte_len)
+    };
+    file.read_exact(dst).ok()?;
+    Some(points)
+}
+
+fn save_cached_points(k: u8, points: &[Point]) {
+    let path = cache_path(k);
+    let Ok(mut file) = std::fs::File::create(&path) else { return };
+
+    let n = points.len() as u64;
+    let mut header = [0u8; 16];
+    header[..8].copy_from_slice(&CACHE_MAGIC);
+    header[8..16].copy_from_slice(&n.to_le_bytes());
+    if file.write_all(&header).is_err() { return; }
+
+    let byte_len = points.len() * std::mem::size_of::<Point>();
+    let src = unsafe {
+        std::slice::from_raw_parts(points.as_ptr() as *const u8, byte_len)
+    };
+    let _ = file.write_all(src);
+}
+
+fn get_or_generate_curvepoints(k: u8) -> Vec<Point> {
+    if let Some(pts) = load_cached_points(k) {
+        println!("Loaded 2^{k} = {} cached curve points from {}", 1u64 << k, cache_path(k).display());
+        return pts;
+    }
+    let pts = generate_curvepoints(k);
+    save_cached_points(k, &pts);
+    println!("  (saved to {})", cache_path(k).display());
+    pts
+}
+
+// ── Point / coefficient generation ──────────────────────────────────────────
 
 fn generate_curvepoints(k: u8) -> Vec<Point> {
     let n: u64 = {
@@ -129,7 +199,7 @@ fn msm(c: &mut Criterion) {
         .chain(MULTICORE_RANGE.iter())
         .max()
         .unwrap_or(&16);
-    let bases = generate_curvepoints(max_k);
+    let bases = get_or_generate_curvepoints(max_k);
     let bits = [1, 8, 16, 32, 64, 128, 256];
     let coeffs: Vec<_> = bits
         .iter()

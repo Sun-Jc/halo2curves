@@ -4,15 +4,22 @@
 //! Run with:
 //!     rustup run stable cargo run --release --features gpu --example gpu_compare
 //!
-//! Sizes: k = 22, 24, 26 (configurable via SIZES below)
+//! Sizes: k = 22, 24, 26 (configurable via command-line args, e.g. `-- 22 24`)
+//!
+//! Base points are cached in /tmp/halo2_msm_bases_k{K}.bin to avoid
+//! re-generating them on every run (~20s for k=22, minutes for k=26).
+//! The cache uses raw memcpy of the internal Montgomery-form representation
+//! for zero-overhead serialization.
 
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use ff::Field;
 use group::{Curve, Group};
 use group::prime::PrimeCurveAffine;
 use halo2curves::bn256::{Fr, G1Affine, G1};
-use halo2curves::gpu::{msm_gpu, msm_gpu_timed, msm_gpu_glv, GpuMsmTiming};
+use halo2curves::gpu::{msm_gpu, msm_gpu_timed, msm_gpu_glv};
 use halo2curves::msm::msm_best;
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
@@ -29,6 +36,92 @@ const ITERS: usize = 3;
 
 /// Default sizes to benchmark (can override via command-line args, e.g. `-- 22 24`)
 const DEFAULT_SIZES: &[u8] = &[22, 24, 26];
+
+// ── Raw binary cache for base points ────────────────────────────────────────
+//
+// Format:  [magic: 8 bytes][n: 8 bytes (u64 LE)][points: n * 64 bytes]
+// Points are stored as raw memory (Montgomery-form [u64;4] × 2 per G1Affine).
+// No per-element serialization overhead — single read()/write() syscall.
+
+const CACHE_MAGIC: [u8; 8] = *b"H2CPTS01";
+
+fn cache_path(k: u8) -> PathBuf {
+    PathBuf::from(format!("/tmp/halo2_msm_bases_k{}.bin", k))
+}
+
+/// Try to load cached base points from /tmp.
+/// Returns None if cache doesn't exist or is corrupted.
+fn load_cached_points(k: u8) -> Option<Vec<G1Affine>> {
+    let path = cache_path(k);
+    let mut file = std::fs::File::open(&path).ok()?;
+
+    // Read and verify header
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).ok()?;
+    if &header[..8] != &CACHE_MAGIC {
+        eprintln!("  cache {}: bad magic, regenerating", path.display());
+        return None;
+    }
+    let n = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+    let expected_n = 1usize << k;
+    if n != expected_n {
+        eprintln!("  cache {}: n={} expected {}, regenerating", path.display(), n, expected_n);
+        return None;
+    }
+
+    // Read points as raw bytes — single syscall for the entire buffer
+    let byte_len = n * std::mem::size_of::<G1Affine>();
+    let mut points = vec![G1Affine::identity(); n];
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(points.as_mut_ptr() as *mut u8, byte_len)
+    };
+    file.read_exact(dst).ok()?;
+
+    Some(points)
+}
+
+/// Save base points to /tmp cache as raw bytes.
+fn save_cached_points(k: u8, points: &[G1Affine]) {
+    let path = cache_path(k);
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  warning: cannot create cache {}: {}", path.display(), e);
+            return;
+        }
+    };
+
+    // Write header
+    let n = points.len() as u64;
+    let mut header = [0u8; 16];
+    header[..8].copy_from_slice(&CACHE_MAGIC);
+    header[8..16].copy_from_slice(&n.to_le_bytes());
+    if file.write_all(&header).is_err() { return; }
+
+    // Write points as raw bytes — single syscall
+    let byte_len = points.len() * std::mem::size_of::<G1Affine>();
+    let src = unsafe {
+        std::slice::from_raw_parts(points.as_ptr() as *const u8, byte_len)
+    };
+    let _ = file.write_all(src);
+}
+
+/// Get base points for a given k: load from cache or generate + cache.
+fn get_or_gen_points(k: u8) -> Vec<G1Affine> {
+    // Try cache first
+    if let Some(points) = load_cached_points(k) {
+        return points;
+    }
+
+    // Generate
+    let n = 1usize << k;
+    let points = gen_points(n);
+
+    // Cache for next time
+    save_cached_points(k, &points);
+
+    points
+}
 
 fn gen_points(n: usize) -> Vec<G1Affine> {
     let projs: Vec<G1> = (0..n)
@@ -101,10 +194,16 @@ fn main() {
     let max_k = *sizes.iter().max().unwrap();
     let max_n = 1usize << max_k;
 
-    println!("Generating {} points (2^{})...", max_n, max_k);
+    // Load or generate base points (cached in /tmp as raw bytes)
     let t0 = Instant::now();
-    let bases = gen_points(max_n);
-    println!("  done in {:.1}s", t0.elapsed().as_secs_f64());
+    let cache_file = cache_path(max_k);
+    let cached = cache_file.exists();
+    print!("{} {} points (2^{})...",
+        if cached { "Loading cached" } else { "Generating" }, max_n, max_k);
+    std::io::stdout().flush().unwrap();
+    let bases = get_or_gen_points(max_k);
+    println!("  done in {:.1}s{}", t0.elapsed().as_secs_f64(),
+        if cached { format!(" [from {}]", cache_file.display()) } else { " [saved to cache]".into() });
 
     println!("Generating {} 256-bit scalars...", max_n);
     let t0 = Instant::now();
