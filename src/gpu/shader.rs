@@ -2,11 +2,18 @@
 //!
 //! Contains all MSL kernels as a Rust string constant, compiled at runtime.
 //!
-//! Optimizations vs. naive version:
-//! - fq_mul/fq_add/fq_sub support aliased output (in-place), eliminating fq_copy overhead
-//! - projective_madd rewritten to minimize temporaries and copies
-//! - bucket_accumulate_all: first point loaded directly as accumulator (no identity madd)
-//! - fq_neg made branchless
+//! Architecture:
+//! - Bucket accumulation uses **Jacobian coordinates** with Bernstein-Lange 2007 formulas
+//!   for maximum performance: madd = 7M+4S (vs 11M in projective RCB2015)
+//! - PBPR reduction uses Jacobian add (11M+5S) and dbl (2M+5S)
+//! - GPU outputs Jacobian points; host converts to halo2curves projective
+//!
+//! Key optimizations:
+//! - Dedicated fq_sqr exploits a[i]*a[j] symmetry (36 muls vs 64 in fq_mul)
+//! - madd-2007-bl: 7M+4S vs previous 11M — main bucket kernel ~25% faster
+//! - Alias-safe fq_mul/fq_add/fq_sub eliminate fq_copy overhead
+//! - First point loaded directly as accumulator (skip identity madd)
+//! - Branchless fq_neg
 
 pub(crate) const SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -31,9 +38,6 @@ constant uint FQ_ONE[8] = {
     0x7879462cu, 0x666ea36fu, 0x9a07df2fu, 0x0e0a77c1u
 };
 
-// Zero
-constant uint FQ_ZERO[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-
 // Typedef for clarity
 typedef uint Fq[8];
 
@@ -46,7 +50,6 @@ inline void fq_add(thread const uint* a, thread const uint* b, thread uint* c) {
         sum[i] = uint(s & 0xFFFFFFFFul);
         carry = s >> 32;
     }
-    // Conditional subtraction of modulus
     ulong borrow = 0;
     uint diff[8];
     for (int i = 0; i < 8; i++) {
@@ -81,9 +84,7 @@ inline void fq_sub(thread const uint* a, thread const uint* b, thread uint* c) {
 inline void fq_neg(thread const uint* a, thread uint* c) {
     uint is_nonzero = 0;
     for (int i = 0; i < 8; i++) is_nonzero |= a[i];
-    // mask: all 1s if nonzero, all 0s if zero
     uint mask = (is_nonzero != 0) ? 0xFFFFFFFFu : 0u;
-
     ulong borrow = 0;
     for (int i = 0; i < 8; i++) {
         ulong d = ulong(FQ_MOD[i] & mask) - ulong(a[i]) - borrow;
@@ -93,7 +94,7 @@ inline void fq_neg(thread const uint* a, thread uint* c) {
 }
 
 // ---- Montgomery multiplication: c = a * b * R^{-1} mod p (CIOS, 32-bit) ----
-// Supports c aliasing a or b (result is computed in t[] then written to c at the end).
+// Supports c aliasing a or b.
 inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
     ulong t[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
@@ -119,7 +120,6 @@ inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
         t[8] = sum >> 32;
     }
 
-    // Final conditional subtraction
     ulong borrow = 0;
     uint diff[8];
     for (int i = 0; i < 8; i++) {
@@ -133,9 +133,78 @@ inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
     }
 }
 
-// ---- Montgomery squaring: c = a^2 * R^{-1} mod p ----
+// ---- Montgomery squaring: c = a^2 * R^{-1} mod p (optimized) ----
+// Exploits symmetry: off-diagonal products computed once and doubled.
+// 28 off-diagonal + 8 diagonal = 36 multiplies (vs 64 in fq_mul).
+// Plus 64 for reduction = 100 total (vs 128 in fq_mul = ~22% faster).
+// Supports c aliasing a.
 inline void fq_sqr(thread const uint* a, thread uint* c) {
-    fq_mul(a, a, c);
+    ulong t[17] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+    // Off-diagonal: a[i]*a[j] for i < j (28 multiplies)
+    for (int i = 0; i < 7; i++) {
+        ulong carry = 0;
+        for (int j = i + 1; j < 8; j++) {
+            ulong prod = ulong(a[i]) * ulong(a[j]) + t[i+j] + carry;
+            t[i+j] = prod & 0xFFFFFFFFul;
+            carry = prod >> 32;
+        }
+        t[i+8] += carry;
+    }
+
+    // Double off-diagonal terms
+    ulong dbl_carry = 0;
+    for (int i = 1; i < 16; i++) {
+        ulong v = (t[i] << 1) | dbl_carry;
+        t[i] = v & 0xFFFFFFFFul;
+        dbl_carry = v >> 32;
+    }
+    t[16] = dbl_carry;
+
+    // Add diagonal: a[i]^2 (8 multiplies)
+    ulong carry = 0;
+    for (int i = 0; i < 8; i++) {
+        ulong prod = ulong(a[i]) * ulong(a[i]) + t[2*i] + carry;
+        t[2*i] = prod & 0xFFFFFFFFul;
+        carry = prod >> 32;
+        ulong s = t[2*i+1] + carry;
+        t[2*i+1] = s & 0xFFFFFFFFul;
+        carry = s >> 32;
+    }
+    t[16] += carry;
+
+    // Montgomery reduction: 8 rounds (64 multiplies, same as fq_mul)
+    for (int i = 0; i < 8; i++) {
+        uint m = uint(t[i] & 0xFFFFFFFFul) * FQ_INV;
+        ulong um = ulong(m);
+        ulong rc = (um * ulong(FQ_MOD[0]) + t[i]) >> 32;
+        for (int j = 1; j < 8; j++) {
+            ulong prod = um * ulong(FQ_MOD[j]) + t[i+j] + rc;
+            t[i+j] = prod & 0xFFFFFFFFul;
+            rc = prod >> 32;
+        }
+        ulong s = t[i+8] + rc;
+        t[i+8] = s & 0xFFFFFFFFul;
+        rc = s >> 32;
+        for (int k = i+9; k < 17 && rc != 0; k++) {
+            s = t[k] + rc;
+            t[k] = s & 0xFFFFFFFFul;
+            rc = s >> 32;
+        }
+    }
+
+    // Result in t[8..15], conditional subtraction
+    ulong borrow = 0;
+    uint diff[8];
+    for (int i = 0; i < 8; i++) {
+        ulong d = t[i+8] - ulong(FQ_MOD[i]) - borrow;
+        diff[i] = uint(d & 0xFFFFFFFFul);
+        borrow = (d >> 63) & 1;
+    }
+    uint use_t = uint(borrow);
+    for (int i = 0; i < 8; i++) {
+        c[i] = use_t ? uint(t[i+8] & 0xFFFFFFFFul) : diff[i];
+    }
 }
 
 // ---- Double: c = 2*a mod p (supports c aliasing a) ----
@@ -166,164 +235,158 @@ inline void fq_store(thread const uint* src, device uint* dst) {
 }
 
 // ============================================================================
-// Projective point operations — matches halo2curves' RCB2015 formulas
+// Jacobian point operations — BN254 G1 (y² = x³ + 3, a=0)
 // ============================================================================
+//
+// Jacobian coordinates: (X : Y : Z) represents affine (X/Z², Y/Z³)
+// Identity: any (X, Y, 0) — we use Z=0 convention
+// Affine point (x, y) → Jacobian (x, y, 1)
+// Negation: (X, -Y, Z)
 
-// Projective point: (X : Y : Z), identity = (0 : Y : 0) for any Y
-// halo2curves identity: x=0, y=1_mont, z=0
-// Affine point: (x, y), 16 u32s = 2 × Fq
-// Curve: y² = x³ + b, where b = 3 for BN254 G1, so 3b = 9
-
-// mul_by_3b(x) = 9*x = 8*x + x (matching halo2curves BN256 G1 specialization)
-// Supports c aliasing a.
-inline void fq_mul_by_3b(thread const uint* a, thread uint* c) {
-    uint t1[8], t2[8];
-    fq_dbl(a, t1);      // 2x
-    fq_dbl(t1, t2);     // 4x
-    fq_dbl(t2, t1);     // 8x
-    fq_add(t1, a, c);   // 9x
-}
-
-// ---- Mixed addition: R = P + Q, P=(X1:Y1:Z1) projective, Q=(x2,y2) affine ----
-// Algorithm 8, https://eprint.iacr.org/2015/1060.pdf (a=0 case)
-// Complete addition formula — handles all cases including doubling, identity.
-// IMPORTANT: When Q is identity (affine 0,0), caller must handle separately.
-// OPTIMIZED: All fq_mul/fq_add/fq_sub support aliased output, eliminating fq_copy.
-inline void projective_madd(
+// ---- Jacobian mixed addition: R = P + Q ----
+// P = (X1, Y1, Z1) Jacobian, Q = (x2, y2) affine (Z2 = 1)
+// madd-2007-bl from https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html
+// Cost: 7M + 4S + 9add + 3×2 + 1×4
+// NOT complete: fails when P = ±Q. Safe for MSM bucket accumulation
+// since different base points are essentially random.
+// Supports output aliasing input (x3=x1, etc.) via local temporaries.
+inline void jacobian_madd(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread const uint* x2, thread const uint* y2,
     thread uint* x3, thread uint* y3, thread uint* z3
 ) {
-    uint t0[8], t1[8], t2[8], t3[8], t4[8];
+    uint Z1Z1[8], U2[8], S2[8], H[8], HH[8], I[8], J[8], r[8], V[8];
+    uint t1[8];
 
-    // t0 = X1 * x2
-    fq_mul(x1, x2, t0);
-    // t1 = Y1 * y2
-    fq_mul(y1, y2, t1);
-    // t3 = x2 + y2
-    fq_add(x2, y2, t3);
-    // t4 = X1 + Y1
-    fq_add(x1, y1, t4);
-    // t3 = t3 * t4 (alias-safe)
-    fq_mul(t3, t4, t3);
-    // t4 = t0 + t1
-    fq_add(t0, t1, t4);
-    // t3 = t3 - t4 (alias-safe)
-    fq_sub(t3, t4, t3);
-    // t4 = y2 * Z1
-    fq_mul(y2, z1, t4);
-    // t4 = t4 + Y1 (alias-safe)
-    fq_add(t4, y1, t4);
-    // y3 = x2 * Z1
-    fq_mul(x2, z1, y3);
-    // y3 = y3 + X1 (alias-safe)
-    fq_add(y3, x1, y3);
-    // x3 = t0 + t0
-    fq_dbl(t0, x3);
-    // t0 = x3 + t0 (alias-safe)
-    fq_add(x3, t0, t0);
-    // t2 = mul_by_3b(Z1)
-    fq_mul_by_3b(z1, t2);
-    // z3 = t1 + t2
-    fq_add(t1, t2, z3);
-    // t1 = t1 - t2 (alias-safe)
-    fq_sub(t1, t2, t1);
-    // y3 = mul_by_3b(y3) (alias-safe)
-    fq_mul_by_3b(y3, y3);
-    // x3 = t4 * y3
-    fq_mul(t4, y3, x3);
-    // t2 = t3 * t1
-    fq_mul(t3, t1, t2);
-    // x3 = t2 - x3 (alias-safe)
-    fq_sub(t2, x3, x3);
-    // y3 = y3 * t0 (alias-safe)
-    fq_mul(y3, t0, y3);
-    // t1 = t1 * z3 (alias-safe)
-    fq_mul(t1, z3, t1);
-    // y3 = t1 + y3 (alias-safe)
-    fq_add(t1, y3, y3);
-    // t0 = t0 * t3 (alias-safe)
-    fq_mul(t0, t3, t0);
-    // z3 = z3 * t4 (alias-safe)
-    fq_mul(z3, t4, z3);
-    // z3 = z3 + t0 (alias-safe)
-    fq_add(z3, t0, z3);
+    fq_sqr(z1, Z1Z1);           // Z1Z1 = Z1^2              (1S)
+    fq_mul(x2, Z1Z1, U2);       // U2 = x2 * Z1Z1           (1M)
+    fq_mul(z1, Z1Z1, t1);       // t1 = Z1 * Z1Z1 = Z1^3    (2M)
+    fq_mul(y2, t1, S2);         // S2 = y2 * Z1^3            (3M)
+    fq_sub(U2, x1, H);          // H = U2 - X1
+    fq_sqr(H, HH);              // HH = H^2                  (2S)
+    fq_dbl(HH, I);              // I = 2*HH
+    fq_dbl(I, I);               // I = 4*HH
+    fq_mul(H, I, J);            // J = H * I                 (4M)
+    fq_sub(S2, y1, r);          // r = S2 - Y1
+    fq_dbl(r, r);               // r = 2*(S2 - Y1)
+    fq_mul(x1, I, V);           // V = X1 * I                (5M)
+
+    // X3 = r^2 - J - 2*V
+    fq_sqr(r, x3);              // x3 = r^2                  (3S)
+    fq_sub(x3, J, x3);          // x3 = r^2 - J
+    fq_dbl(V, t1);              // t1 = 2*V
+    fq_sub(x3, t1, x3);         // X3 = r^2 - J - 2*V
+
+    // Y3 = r*(V - X3) - 2*Y1*J
+    fq_mul(y1, J, t1);          // t1 = Y1*J                 (6M)  — must read y1 BEFORE writing y3
+    fq_dbl(t1, t1);             // t1 = 2*Y1*J
+    uint t2[8];
+    fq_sub(V, x3, t2);          // t2 = V - X3
+    fq_mul(r, t2, y3);          // y3 = r*(V-X3)             (7M)
+    fq_sub(y3, t1, y3);         // Y3 = r*(V-X3) - 2*Y1*J
+
+    // Z3 = (Z1+H)^2 - Z1Z1 - HH
+    fq_add(z1, H, t1);          // t1 = Z1 + H
+    fq_sqr(t1, z3);             // z3 = (Z1+H)^2             (4S)
+    fq_sub(z3, Z1Z1, z3);       // z3 -= Z1Z1
+    fq_sub(z3, HH, z3);         // Z3 = (Z1+H)^2 - Z1Z1 - HH
 }
 
-// ---- Full projective addition: R = P + Q, both projective ----
-// Algorithm 1, https://eprint.iacr.org/2015/1060.pdf (a=0 case)
-// NOTE: x3/y3/z3 MUST NOT alias x1/y1/z1 or x2/y2/z2 — x3/y3 are used as
-// temporary storage before the final result is computed.
-// Individual fq_mul/fq_add/fq_sub are alias-safe (for temporaries t0-t4).
-inline void projective_add(
+// ---- Full Jacobian addition: R = P + Q ----
+// P = (X1, Y1, Z1), Q = (X2, Y2, Z2), both Jacobian
+// add-2007-bl from https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html
+// Cost: 11M + 5S + 9add + 4×2
+// NOT complete: fails when P = ±Q. Safe for PBPR since bucket points are random.
+// Supports output aliasing input via local temporaries.
+inline void jacobian_add(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread const uint* x2, thread const uint* y2, thread const uint* z2,
     thread uint* x3, thread uint* y3, thread uint* z3
 ) {
-    uint t0[8], t1[8], t2[8], t3[8], t4[8];
+    uint Z1Z1[8], Z2Z2[8], U1[8], U2[8], S1[8], S2[8];
+    uint H[8], I[8], J[8], r[8], V[8];
+    uint t1[8], t2[8];
 
-    fq_mul(x1, x2, t0);         // t0 = X1*X2
-    fq_mul(y1, y2, t1);         // t1 = Y1*Y2
-    fq_mul(z1, z2, t2);         // t2 = Z1*Z2
-    fq_add(x1, y1, t3);         // t3 = X1+Y1
-    fq_add(x2, y2, t4);         // t4 = X2+Y2
-    fq_mul(t3, t4, t3);         // t3 = (X1+Y1)*(X2+Y2)
-    fq_add(t0, t1, t4);         // t4 = t0+t1
-    fq_sub(t3, t4, t3);         // t3 = t3-t4 = X1*Y2+X2*Y1
-    fq_add(y1, z1, t4);         // t4 = Y1+Z1
-    fq_add(y2, z2, x3);         // x3 = Y2+Z2 (temporary)
-    fq_mul(t4, x3, t4);         // t4 = (Y1+Z1)*(Y2+Z2)
-    fq_add(t1, t2, x3);         // x3 = t1+t2
-    fq_sub(t4, x3, t4);         // t4 = Y1*Z2+Y2*Z1
-    fq_add(x1, z1, x3);         // x3 = X1+Z1
-    fq_add(x2, z2, y3);         // y3 = X2+Z2
-    fq_mul(x3, y3, x3);         // x3 = (X1+Z1)*(X2+Z2)
-    fq_add(t0, t2, y3);         // y3 = t0+t2
-    fq_sub(x3, y3, y3);         // y3 = X1*Z2+X2*Z1
-    fq_dbl(t0, x3);             // x3 = 2*t0
-    fq_add(x3, t0, t0);         // t0 = 3*t0
-    fq_mul_by_3b(t2, t2);       // t2 = 3b*t2 = 9*t2
-    fq_add(t1, t2, z3);         // z3 = t1+t2
-    fq_sub(t1, t2, t1);         // t1 = t1-t2
-    fq_mul_by_3b(y3, y3);       // y3 = 3b*y3 = 9*y3
-    fq_mul(t4, y3, x3);         // x3 = t4*y3
-    fq_mul(t3, t1, t2);         // t2 = t3*t1
-    fq_sub(t2, x3, x3);         // x3 = t2-x3
-    fq_mul(y3, t0, y3);         // y3 = y3*t0
-    fq_mul(t1, z3, t1);         // t1 = t1*z3
-    fq_add(t1, y3, y3);         // y3 = t1+y3
-    fq_mul(t0, t3, t0);         // t0 = t0*t3
-    fq_mul(z3, t4, z3);         // z3 = z3*t4
-    fq_add(z3, t0, z3);         // z3 = z3+t0
+    fq_sqr(z1, Z1Z1);              // Z1Z1 = Z1^2
+    fq_sqr(z2, Z2Z2);              // Z2Z2 = Z2^2
+    fq_mul(x1, Z2Z2, U1);          // U1 = X1 * Z2Z2
+    fq_mul(x2, Z1Z1, U2);          // U2 = X2 * Z1Z1
+    fq_mul(z2, Z2Z2, t1);          // t1 = Z2^3
+    fq_mul(y1, t1, S1);            // S1 = Y1 * Z2^3
+    fq_mul(z1, Z1Z1, t1);          // t1 = Z1^3
+    fq_mul(y2, t1, S2);            // S2 = Y2 * Z1^3
+    fq_sub(U2, U1, H);             // H = U2 - U1
+    fq_dbl(H, t1);                 // t1 = 2*H
+    fq_sqr(t1, I);                 // I = (2*H)^2
+    fq_mul(H, I, J);               // J = H * I
+    fq_sub(S2, S1, r);             // r = S2 - S1
+    fq_dbl(r, r);                  // r = 2*(S2-S1)
+    fq_mul(U1, I, V);              // V = U1 * I
+
+    // X3 = r^2 - J - 2*V
+    fq_sqr(r, x3);
+    fq_sub(x3, J, x3);
+    fq_dbl(V, t1);
+    fq_sub(x3, t1, x3);
+
+    // Y3 = r*(V-X3) - 2*S1*J
+    fq_sub(V, x3, t1);
+    fq_mul(r, t1, y3);
+    fq_mul(S1, J, t1);
+    fq_dbl(t1, t1);
+    fq_sub(y3, t1, y3);
+
+    // Z3 = ((Z1+Z2)^2 - Z1Z1 - Z2Z2) * H
+    fq_add(z1, z2, t1);
+    fq_sqr(t1, t2);
+    fq_sub(t2, Z1Z1, t2);
+    fq_sub(t2, Z2Z2, t2);
+    fq_mul(t2, H, z3);
 }
 
-// ---- Point doubling: R = 2*P (projective, a=0) ----
-// Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
-// OPTIMIZED: alias-safe operations eliminate fq_copy.
-inline void projective_dbl(
+// ---- Jacobian point doubling: R = 2*P (a=0) ----
+// dbl-2009-l from https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html
+// Cost: 2M + 5S + 6add + 3×2 + 1×3 + 1×8
+// Supports output aliasing input via local temporaries.
+inline void jacobian_dbl(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread uint* x3, thread uint* y3, thread uint* z3
 ) {
-    uint t0[8], t1[8], t2[8];
+    uint A[8], B[8], C[8], D[8], E[8], F[8];
+    uint t1[8];
 
-    fq_sqr(y1, t0);              // t0 = Y1^2
-    fq_dbl(t0, z3);              // z3 = 2*t0
-    fq_dbl(z3, z3);              // z3 = 4*t0
-    fq_dbl(z3, z3);              // z3 = 8*t0
-    fq_mul(y1, z1, t1);          // t1 = Y1*Z1
-    fq_sqr(z1, t2);              // t2 = Z1^2
-    fq_mul_by_3b(t2, t2);        // t2 = 9*Z1^2
-    fq_mul(t2, z3, x3);          // x3 = 9*Z1^2 * 8*Y1^2
-    fq_add(t0, t2, y3);          // y3 = Y1^2 + 9*Z1^2
-    fq_mul(t1, z3, z3);          // z3 = Y1*Z1 * 8*Y1^2
-    fq_dbl(t2, t1);              // t1 = 2*9*Z1^2
-    fq_add(t1, t2, t2);          // t2 = 3*9*Z1^2 = 27*Z1^2
-    fq_sub(t0, t2, t0);          // t0 = Y1^2 - 27*Z1^2
-    fq_mul(t0, y3, y3);          // y3 = (Y1^2-27Z1^2)*(Y1^2+9Z1^2)
-    fq_add(x3, y3, y3);          // y3 = x3 + y3
-    fq_mul(x1, y1, t1);          // t1 = X1*Y1
-    fq_mul(t0, t1, x3);          // x3 = (Y1^2-27Z1^2)*X1*Y1
-    fq_dbl(x3, x3);              // x3 = 2*(Y1^2-27Z1^2)*X1*Y1
+    fq_sqr(x1, A);               // A = X1^2                  (1S)
+    fq_sqr(y1, B);               // B = Y1^2                  (2S)
+    fq_sqr(B, C);                // C = B^2 = Y1^4            (3S)
+
+    // D = 2*((X1+B)^2 - A - C)
+    fq_add(x1, B, t1);           // t1 = X1 + B
+    fq_sqr(t1, D);               // D = (X1+B)^2              (4S)
+    fq_sub(D, A, D);             // D -= A
+    fq_sub(D, C, D);             // D -= C  (now D = X1*B... hmm, it's X1*Y1^2 effectively)
+    fq_dbl(D, D);                // D = 2*(X1*B)
+
+    // E = 3*A  (= 3*X1^2)
+    fq_dbl(A, E);                // E = 2*A
+    fq_add(E, A, E);             // E = 3*A
+
+    fq_sqr(E, F);                // F = E^2 = (3*X1^2)^2      (5S)
+
+    // X3 = F - 2*D
+    fq_dbl(D, t1);               // t1 = 2*D
+    fq_sub(F, t1, x3);           // X3 = F - 2*D
+
+    // Y3 = E*(D-X3) - 8*C
+    fq_sub(D, x3, t1);           // t1 = D - X3
+    fq_mul(E, t1, y3);           // y3 = E*(D-X3)             (1M)
+    fq_dbl(C, t1);               // t1 = 2*C
+    fq_dbl(t1, t1);              // t1 = 4*C
+    fq_dbl(t1, t1);              // t1 = 8*C
+    fq_sub(y3, t1, y3);          // Y3 = E*(D-X3) - 8*C
+
+    // Z3 = 2*Y1*Z1
+    fq_mul(y1, z1, z3);          // z3 = Y1*Z1                (2M)
+    fq_dbl(z3, z3);              // Z3 = 2*Y1*Z1
 }
 
 // ---- Double-and-add: R = scalar * P (for small scalars, used in PBPR) ----
@@ -332,10 +395,10 @@ inline void double_and_add(
     uint scalar,
     thread uint* rx, thread uint* ry, thread uint* rz
 ) {
-    // Start with identity
-    for (int i = 0; i < 8; i++) rx[i] = 0;
-    for (int i = 0; i < 8; i++) ry[i] = FQ_ONE[i];
-    for (int i = 0; i < 8; i++) rz[i] = 0;
+    // Start with identity (Z=0)
+    for (int i = 0; i < 8; i++) rx[i] = FQ_ONE[i]; // X = 1 (arbitrary)
+    for (int i = 0; i < 8; i++) ry[i] = FQ_ONE[i]; // Y = 1 (arbitrary)
+    for (int i = 0; i < 8; i++) rz[i] = 0;         // Z = 0 → identity
 
     if (scalar == 0) return;
 
@@ -347,18 +410,27 @@ inline void double_and_add(
     uint s = scalar;
     while (s != 0) {
         if (s & 1) {
-            uint ox[8], oy[8], oz[8];
-            projective_add(rx, ry, rz, tx, ty, tz, ox, oy, oz);
-            fq_copy(ox, rx);
-            fq_copy(oy, ry);
-            fq_copy(oz, rz);
+            // Check if R is identity (Z=0)
+            if (fq_is_zero(rz)) {
+                fq_copy(tx, rx);
+                fq_copy(ty, ry);
+                fq_copy(tz, rz);
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(rx, ry, rz, tx, ty, tz, ox, oy, oz);
+                fq_copy(ox, rx);
+                fq_copy(oy, ry);
+                fq_copy(oz, rz);
+            }
         }
-        uint dx[8], dy[8], dz[8];
-        projective_dbl(tx, ty, tz, dx, dy, dz);
-        fq_copy(dx, tx);
-        fq_copy(dy, ty);
-        fq_copy(dz, tz);
         s >>= 1;
+        if (s != 0) {
+            uint dx[8], dy[8], dz[8];
+            jacobian_dbl(tx, ty, tz, dx, dy, dz);
+            fq_copy(dx, tx);
+            fq_copy(dy, ty);
+            fq_copy(dz, tz);
+        }
     }
 }
 
@@ -379,6 +451,85 @@ kernel void test_field_ops(
     fq_load(b + off, lb);
     fq_mul(la, lb, lc);
     fq_store(lc, c + off);
+}
+
+// ---- Test kernel: fq_sqr vs fq_mul(a,a) ----
+// Writes two results: sqr result at c[id*16..id*16+8], mul(a,a) at c[id*16+8..id*16+16]
+kernel void test_fq_sqr(
+    device const uint* a [[buffer(0)]],
+    device uint* c       [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint off = id * 8;
+    uint la[8], sqr_result[8], mul_result[8];
+    fq_load(a + off, la);
+    fq_sqr(la, sqr_result);
+    fq_mul(la, la, mul_result);
+    uint out_off = id * 16;
+    fq_store(sqr_result, c + out_off);
+    fq_store(mul_result, c + out_off + 8);
+}
+
+// ---- Test kernel: Jacobian add ----
+// Takes two Jacobian points, outputs one Jacobian point
+kernel void test_jacobian_add(
+    device const uint* p1  [[buffer(0)]],
+    device const uint* p2  [[buffer(1)]],
+    device uint* out       [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint off = id * 24;
+    uint x1[8], y1[8], z1[8], x2[8], y2[8], z2[8];
+    uint rx[8], ry[8], rz[8];
+    fq_load(p1 + off, x1);
+    fq_load(p1 + off + 8, y1);
+    fq_load(p1 + off + 16, z1);
+    fq_load(p2 + off, x2);
+    fq_load(p2 + off + 8, y2);
+    fq_load(p2 + off + 16, z2);
+    jacobian_add(x1, y1, z1, x2, y2, z2, rx, ry, rz);
+    fq_store(rx, out + off);
+    fq_store(ry, out + off + 8);
+    fq_store(rz, out + off + 16);
+}
+
+// ---- Test kernel: Jacobian dbl ----
+kernel void test_jacobian_dbl(
+    device const uint* p1  [[buffer(0)]],
+    device uint* out       [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint off = id * 24;
+    uint x1[8], y1[8], z1[8];
+    uint rx[8], ry[8], rz[8];
+    fq_load(p1 + off, x1);
+    fq_load(p1 + off + 8, y1);
+    fq_load(p1 + off + 16, z1);
+    jacobian_dbl(x1, y1, z1, rx, ry, rz);
+    fq_store(rx, out + off);
+    fq_store(ry, out + off + 8);
+    fq_store(rz, out + off + 16);
+}
+
+// ---- Test kernel: double_and_add ----
+// Takes a Jacobian point and a scalar, outputs scalar*P
+kernel void test_double_and_add(
+    device const uint* p1      [[buffer(0)]],
+    device const uint* scalars [[buffer(1)]],
+    device uint* out           [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint off = id * 24;
+    uint x1[8], y1[8], z1[8];
+    uint rx[8], ry[8], rz[8];
+    fq_load(p1 + off, x1);
+    fq_load(p1 + off + 8, y1);
+    fq_load(p1 + off + 16, z1);
+    uint s = scalars[id];
+    double_and_add(x1, y1, z1, s, rx, ry, rz);
+    fq_store(rx, out + off);
+    fq_store(ry, out + off + 8);
+    fq_store(rz, out + off + 16);
 }
 
 // ---- Test kernel: field add/sub/neg ----
@@ -427,7 +578,7 @@ kernel void test_jacobian_madd(
     }
 
     uint rx[8], ry[8], rz[8];
-    projective_madd(jx, jy, jz, ax, ay, rx, ry, rz);
+    jacobian_madd(jx, jy, jz, ax, ay, rx, ry, rz);
 
     fq_store(rx, out + joff);
     fq_store(ry, out + joff + 8);
@@ -435,8 +586,10 @@ kernel void test_jacobian_madd(
 }
 
 // ---- Main kernel: bucket accumulation (all windows in one dispatch) ----
-// OPTIMIZED: First scatter entry initializes accumulator directly (skip identity madd).
-//            Subsequent entries use projective_madd with alias-safe in-place updates.
+// Uses Jacobian coordinates with madd-2007-bl (7M+4S per point added).
+// First scatter entry initializes accumulator directly (skip identity madd).
+// Subsequent entries use jacobian_madd with alias-safe in-place updates.
+// Output: Jacobian (X,Y,Z) per bucket — converted to projective on host.
 kernel void bucket_accumulate_all(
     device const uint* bases           [[buffer(0)]],
     device const uint* scatter_entries [[buffer(1)]],
@@ -458,31 +611,29 @@ kernel void bucket_accumulate_all(
     uint boff = (buckets_start + bucket_idx) * 24;
 
     if (start == end) {
-        // Empty bucket → identity (0, 1_mont, 0)
-        for (int i = 0; i < 8; i++) buckets_out[boff + i] = 0;
+        // Empty bucket → identity in Jacobian: (1, 1, 0)
+        for (int i = 0; i < 8; i++) buckets_out[boff + i] = FQ_ONE[i];
         for (int i = 0; i < 8; i++) buckets_out[boff + 8 + i] = FQ_ONE[i];
         for (int i = 0; i < 8; i++) buckets_out[boff + 16 + i] = 0;
         return;
     }
 
-    // Load first point directly as accumulator (avoid identity + first madd)
+    // Load first point directly as Jacobian accumulator: (x, ±y, 1)
     uint e0 = scatter_start + start;
     uint packed0 = scatter_entries[e0];
     uint base_idx0 = packed0 & 0x7FFFFFFFu;
     uint s0 = packed0 >> 31;
     uint poff0 = base_idx0 * 16;
 
-    // For first point: acc = (x, ±y, 1_mont) in projective (= affine point as projective)
     uint accx[8], accy[8], accz[8];
     fq_load(bases + poff0, accx);
     fq_load(bases + poff0 + 8, accy);
     if (s0 == 0) {
         fq_neg(accy, accy);
     }
-    for (int i = 0; i < 8; i++) accz[i] = FQ_ONE[i];
+    for (int i = 0; i < 8; i++) accz[i] = FQ_ONE[i]; // Z = 1 (affine → Jacobian)
 
-    // Process remaining entries — projective_madd is alias-safe for output aliasing input,
-    // so we write directly to accx/accy/accz (eliminates 3 fq_copy per iteration).
+    // Process remaining entries — jacobian_madd is alias-safe for output aliasing input
     for (uint e = e0 + 1; e < scatter_start + end; e++) {
         uint packed   = scatter_entries[e];
         uint base_idx = packed & 0x7FFFFFFFu;
@@ -497,7 +648,7 @@ kernel void bucket_accumulate_all(
             fq_neg(ay, ay);
         }
 
-        projective_madd(accx, accy, accz, ax, ay, accx, accy, accz);
+        jacobian_madd(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
     fq_store(accx, buckets_out + boff);
@@ -519,13 +670,12 @@ kernel void bucket_accumulate(
     uint boff_out = tid * 24;
 
     if (start == end) {
-        for (int i = 0; i < 8; i++) buckets_out[boff_out + i] = 0;
+        for (int i = 0; i < 8; i++) buckets_out[boff_out + i] = FQ_ONE[i];
         for (int i = 0; i < 8; i++) buckets_out[boff_out + 8 + i] = FQ_ONE[i];
         for (int i = 0; i < 8; i++) buckets_out[boff_out + 16 + i] = 0;
         return;
     }
 
-    // Load first point directly
     uint packed0 = scatter_entries[start];
     uint base_idx0 = packed0 & 0x7FFFFFFFu;
     uint s0 = packed0 >> 31;
@@ -549,7 +699,7 @@ kernel void bucket_accumulate(
 
         if (s == 0) { fq_neg(ay, ay); }
 
-        projective_madd(accx, accy, accz, ax, ay, accx, accy, accz);
+        jacobian_madd(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
     fq_store(accx, buckets_out + boff_out);
@@ -559,6 +709,7 @@ kernel void bucket_accumulate(
 
 // ============================================================================
 // PBPR: Parallel Bucket Point Reduction (two-stage)
+// Uses Jacobian coordinates throughout.
 // ============================================================================
 
 kernel void bucket_reduce_stage1(
@@ -587,6 +738,11 @@ kernel void bucket_reduce_stage1(
     fq_copy(my, gy);
     fq_copy(mz, gz);
 
+    // Track if g and m are the same point (after initial copy).
+    // When g==m, jacobian_add(g,m) is P+P which fails with incomplete formula.
+    // We must use jacobian_dbl instead.
+    bool g_equals_m = true;
+
     for (uint i = 1; i < bpt; i++) {
         uint bi = seg_start - i;
         uint boff = bi * 24;
@@ -595,18 +751,48 @@ kernel void bucket_reduce_stage1(
         fq_load(buckets + boff + 8,  by);
         fq_load(buckets + boff + 16, bz);
 
-        // m += bucket[bi]
-        uint ox[8], oy[8], oz[8];
-        projective_add(mx, my, mz, bx, by, bz, ox, oy, oz);
-        fq_copy(ox, mx);
-        fq_copy(oy, my);
-        fq_copy(oz, mz);
+        // Skip identity buckets (Z=0)
+        if (!fq_is_zero(bz)) {
+            if (fq_is_zero(mz)) {
+                // m was identity, replace with bucket
+                fq_copy(bx, mx);
+                fq_copy(by, my);
+                fq_copy(bz, mz);
+            } else {
+                // m += bucket[bi]
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(mx, my, mz, bx, by, bz, ox, oy, oz);
+                fq_copy(ox, mx);
+                fq_copy(oy, my);
+                fq_copy(oz, mz);
+            }
+            g_equals_m = false; // m changed, so g != m now
+        }
 
-        // g += m
-        projective_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
-        fq_copy(ox, gx);
-        fq_copy(oy, gy);
-        fq_copy(oz, gz);
+        // g += m (only if m is not identity)
+        if (!fq_is_zero(mz)) {
+            if (fq_is_zero(gz)) {
+                fq_copy(mx, gx);
+                fq_copy(my, gy);
+                fq_copy(mz, gz);
+                g_equals_m = true; // g was just copied from m
+            } else if (g_equals_m) {
+                // g == m, use doubling instead of addition
+                uint ox[8], oy[8], oz[8];
+                jacobian_dbl(gx, gy, gz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+                // g and m are no longer the same (g = 2*m, m = m)
+                g_equals_m = false;
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+            }
+        }
     }
 
     {
@@ -653,15 +839,23 @@ kernel void bucket_reduce_stage2(
     }
 
     uint scalar = bpt * (num_threads - tid - 1);
-    if (scalar > 0) {
+    if (scalar > 0 && !fq_is_zero(mz)) {
         uint dax[8], day[8], daz[8];
         double_and_add(mx, my, mz, scalar, dax, day, daz);
 
-        uint ox[8], oy[8], oz[8];
-        projective_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
-        fq_copy(ox, gx);
-        fq_copy(oy, gy);
-        fq_copy(oz, gz);
+        if (!fq_is_zero(daz)) {
+            if (fq_is_zero(gz)) {
+                fq_copy(dax, gx);
+                fq_copy(day, gy);
+                fq_copy(daz, gz);
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+            }
+        }
     }
 
     {
@@ -707,6 +901,8 @@ kernel void bucket_reduce_stage1_all(
     fq_copy(my, gy);
     fq_copy(mz, gz);
 
+    bool g_equals_m = true;
+
     for (uint i = 1; i < bpt; i++) {
         uint bi = seg_start - i;
         uint boff = bi * 24;
@@ -715,18 +911,42 @@ kernel void bucket_reduce_stage1_all(
         fq_load(buckets + boff + 8,  by);
         fq_load(buckets + boff + 16, bz);
 
-        // m += bucket[bi]
-        uint ox[8], oy[8], oz[8];
-        projective_add(mx, my, mz, bx, by, bz, ox, oy, oz);
-        fq_copy(ox, mx);
-        fq_copy(oy, my);
-        fq_copy(oz, mz);
+        if (!fq_is_zero(bz)) {
+            if (fq_is_zero(mz)) {
+                fq_copy(bx, mx);
+                fq_copy(by, my);
+                fq_copy(bz, mz);
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(mx, my, mz, bx, by, bz, ox, oy, oz);
+                fq_copy(ox, mx);
+                fq_copy(oy, my);
+                fq_copy(oz, mz);
+            }
+            g_equals_m = false;
+        }
 
-        // g += m
-        projective_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
-        fq_copy(ox, gx);
-        fq_copy(oy, gy);
-        fq_copy(oz, gz);
+        if (!fq_is_zero(mz)) {
+            if (fq_is_zero(gz)) {
+                fq_copy(mx, gx);
+                fq_copy(my, gy);
+                fq_copy(mz, gz);
+                g_equals_m = true;
+            } else if (g_equals_m) {
+                uint ox[8], oy[8], oz[8];
+                jacobian_dbl(gx, gy, gz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+                g_equals_m = false;
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+            }
+        }
     }
 
     {
@@ -778,16 +998,23 @@ kernel void bucket_reduce_stage2_all(
     }
 
     uint scalar = bpt * (num_threads - thread_idx - 1);
-    if (scalar > 0) {
+    if (scalar > 0 && !fq_is_zero(mz)) {
         uint dax[8], day[8], daz[8];
         double_and_add(mx, my, mz, scalar, dax, day, daz);
 
-        // alias-safe: output = gx,gy,gz
-        uint ox[8], oy[8], oz[8];
-        projective_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
-        fq_copy(ox, gx);
-        fq_copy(oy, gy);
-        fq_copy(oz, gz);
+        if (!fq_is_zero(daz)) {
+            if (fq_is_zero(gz)) {
+                fq_copy(dax, gx);
+                fq_copy(day, gy);
+                fq_copy(daz, gz);
+            } else {
+                uint ox[8], oy[8], oz[8];
+                jacobian_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
+                fq_copy(ox, gx);
+                fq_copy(oy, gy);
+                fq_copy(oz, gz);
+            }
+        }
     }
 
     {

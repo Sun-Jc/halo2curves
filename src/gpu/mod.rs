@@ -27,7 +27,11 @@ pub(crate) struct GpuContext {
     queue: CommandQueue,
     field_test_pipeline: ComputePipelineState,
     field_addsub_test_pipeline: ComputePipelineState,
+    field_sqr_test_pipeline: ComputePipelineState,
     jacobian_madd_test_pipeline: ComputePipelineState,
+    jacobian_add_test_pipeline: ComputePipelineState,
+    jacobian_dbl_test_pipeline: ComputePipelineState,
+    double_and_add_test_pipeline: ComputePipelineState,
     bucket_accumulate_pipeline: ComputePipelineState,
     bucket_accumulate_all_pipeline: ComputePipelineState,
     bucket_reduce_stage1_pipeline: ComputePipelineState,
@@ -76,12 +80,40 @@ pub(crate) fn gpu_ctx() -> &'static GpuContext {
             .new_compute_pipeline_state_with_function(&field_addsub_fn)
             .expect("Failed to create field_addsub_test pipeline");
 
+        let field_sqr_fn = library
+            .get_function("test_fq_sqr", None)
+            .expect("Missing test_fq_sqr kernel");
+        let field_sqr_test_pipeline = device
+            .new_compute_pipeline_state_with_function(&field_sqr_fn)
+            .expect("Failed to create field_sqr_test pipeline");
+
         let jacobian_madd_test_fn = library
             .get_function("test_jacobian_madd", None)
             .expect("Missing test_jacobian_madd kernel");
         let jacobian_madd_test_pipeline = device
             .new_compute_pipeline_state_with_function(&jacobian_madd_test_fn)
             .expect("Failed to create jacobian_madd_test pipeline");
+
+        let jacobian_add_test_fn = library
+            .get_function("test_jacobian_add", None)
+            .expect("Missing test_jacobian_add kernel");
+        let jacobian_add_test_pipeline = device
+            .new_compute_pipeline_state_with_function(&jacobian_add_test_fn)
+            .expect("Failed to create jacobian_add_test pipeline");
+
+        let jacobian_dbl_test_fn = library
+            .get_function("test_jacobian_dbl", None)
+            .expect("Missing test_jacobian_dbl kernel");
+        let jacobian_dbl_test_pipeline = device
+            .new_compute_pipeline_state_with_function(&jacobian_dbl_test_fn)
+            .expect("Failed to create jacobian_dbl_test pipeline");
+
+        let double_and_add_test_fn = library
+            .get_function("test_double_and_add", None)
+            .expect("Missing test_double_and_add kernel");
+        let double_and_add_test_pipeline = device
+            .new_compute_pipeline_state_with_function(&double_and_add_test_fn)
+            .expect("Failed to create double_and_add_test pipeline");
 
         let bucket_fn = library
             .get_function("bucket_accumulate", None)
@@ -130,7 +162,11 @@ pub(crate) fn gpu_ctx() -> &'static GpuContext {
             queue,
             field_test_pipeline,
             field_addsub_test_pipeline,
+            field_sqr_test_pipeline,
             jacobian_madd_test_pipeline,
+            jacobian_add_test_pipeline,
+            jacobian_dbl_test_pipeline,
+            double_and_add_test_pipeline,
             bucket_accumulate_pipeline,
             bucket_accumulate_all_pipeline,
             bucket_reduce_stage1_pipeline,
@@ -181,8 +217,46 @@ pub(crate) fn u32x8_to_u64x4(src: &[u32; 8]) -> [u64; 4] {
 use crate::arithmetic::CurveEndo;
 use crate::bn256::{Fq, Fr, G1Affine, G1};
 use crate::CurveAffine;
-use ff::{PrimeField, WithSmallOrderMulGroup};
+use ff::{Field, PrimeField, WithSmallOrderMulGroup};
 use group::Group;
+
+/// Convert a point from Jacobian (Xj, Yj, Zj) to halo2curves' internal
+/// homogeneous projective representation G1 { x, y, z }.
+///
+/// Jacobian: affine = (Xj/Zj², Yj/Zj³)
+/// Projective: affine = (x/z, y/z)
+///
+/// So: x_proj = Xj*Zj, y_proj = Yj, z_proj = Zj³
+/// No field inversions needed — just 2 muls + 1 squaring.
+#[inline]
+fn jacobian_to_g1(xj: Fq, yj: Fq, zj: Fq) -> G1 {
+    if zj.is_zero().into() {
+        return G1::identity();
+    }
+    let zj_sq = zj.square();
+    let zj_cu = zj * zj_sq;
+    G1 {
+        x: xj * zj,
+        y: yj,
+        z: zj_cu,
+    }
+}
+
+/// Read a Jacobian point from GPU buffer (u64 pointer + offset in u64s)
+/// and convert to halo2curves G1 (projective).
+#[inline]
+unsafe fn read_jacobian_point(ptr: *const u64, off: usize) -> Option<G1> {
+    let z_all_zero = (*ptr.add(off + 8) | *ptr.add(off + 9)
+        | *ptr.add(off + 10) | *ptr.add(off + 11)) == 0;
+    if z_all_zero {
+        return None;
+    }
+    let p = ptr.add(off);
+    let xj = Fq([*p, *p.add(1), *p.add(2), *p.add(3)]);
+    let yj = Fq([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]);
+    let zj = Fq([*p.add(8), *p.add(9), *p.add(10), *p.add(11)]);
+    Some(jacobian_to_g1(xj, yj, zj))
+}
 
 /// Per-phase timing breakdown for GPU MSM.
 #[derive(Default, Clone)]
@@ -405,31 +479,11 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
 
     if timed { timing.gpu_upload_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
-    // 5. Dispatch bucket_accumulate_all kernel (single dispatch for ALL windows)
-    let t0 = Instant::now();
-    if num_active > 0 {
-        let cb = ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
-        enc.set_buffer(0, Some(&bases_buf), 0);
-        enc.set_buffer(1, Some(&scatter_buf), 0);
-        enc.set_buffer(2, Some(&offsets_buf), 0);
-        enc.set_buffer(3, Some(&buckets_buf), 0);
-        enc.set_buffer(4, Some(&window_params_buf), 0);
-
-        let max_tg = ctx
-            .bucket_accumulate_all_pipeline
-            .max_total_threads_per_threadgroup() as u64;
-        let grid = MTLSize::new(num_buckets as u64, num_active as u64, 1);
-        let tg = MTLSize::new(max_tg.min(num_buckets as u64), 1, 1);
-        enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-    }
-    if timed { timing.gpu_kernel_ms = t0.elapsed().as_secs_f64() * 1000.0; }
-
-    // 6. PBPR or CPU reduction
+    // 5+6. Dispatch bucket_accumulate_all + PBPR in ONE command buffer
+    //
+    // Merging all GPU work into a single commit()+wait() eliminates CPU-GPU
+    // synchronization overhead between kernel and reduce phases (~5ms).
+    // Metal guarantees sequential execution of encoders within one command buffer.
     let use_pbpr = num_buckets >= 256;
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
@@ -440,81 +494,92 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         t
     } else { 0 };
 
+    let g_points_buf;
+    let reduce_params_buf;
+
     let t0 = Instant::now();
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
 
-    if use_pbpr && num_active > 0 {
-        let g_points_buf = ctx.device.new_buffer(
-            (num_active * num_reduce_threads * 24 * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let params_buf = ctx.device.new_buffer(
-            (2 * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        unsafe {
-            let p = params_buf.contents() as *mut u32;
-            *p = num_buckets as u32;
-            *p.add(1) = num_reduce_threads as u32;
-        }
+    if num_active > 0 {
+        let cb = ctx.queue.new_command_buffer();
 
-        // Stage 1 + Stage 2 in a single command buffer for lower dispatch overhead
-        {
-            let cb = ctx.queue.new_command_buffer();
+        // Bucket accumulation kernel
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
+        enc.set_buffer(0, Some(&bases_buf), 0);
+        enc.set_buffer(1, Some(&scatter_buf), 0);
+        enc.set_buffer(2, Some(&offsets_buf), 0);
+        enc.set_buffer(3, Some(&buckets_buf), 0);
+        enc.set_buffer(4, Some(&window_params_buf), 0);
+        let max_tg = ctx.bucket_accumulate_all_pipeline
+            .max_total_threads_per_threadgroup() as u64;
+        let grid = MTLSize::new(num_buckets as u64, num_active as u64, 1);
+        let tg = MTLSize::new(max_tg.min(num_buckets as u64), 1, 1);
+        enc.dispatch_threads(grid, tg);
+        enc.end_encoding();
 
-            // Stage 1
+        if use_pbpr {
+            // PBPR Stage 1 + Stage 2 (same command buffer)
+            g_points_buf = ctx.device.new_buffer(
+                (num_active * num_reduce_threads * 24 * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            reduce_params_buf = ctx.device.new_buffer(
+                (2 * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                let p = reduce_params_buf.contents() as *mut u32;
+                *p = num_buckets as u32;
+                *p.add(1) = num_reduce_threads as u32;
+            }
+
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&params_buf), 0);
-            let max_tg = ctx
-                .bucket_reduce_stage1_all_pipeline
+            enc.set_buffer(2, Some(&reduce_params_buf), 0);
+            let max_tg = ctx.bucket_reduce_stage1_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
             let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
 
-            // Stage 2 (same command buffer — Metal guarantees sequential execution)
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&params_buf), 0);
-            let max_tg = ctx
-                .bucket_reduce_stage2_all_pipeline
+            enc.set_buffer(2, Some(&reduce_params_buf), 0);
+            let max_tg = ctx.bucket_reduce_stage2_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
             let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
-
-            cb.commit();
-            cb.wait_until_completed();
+        } else {
+            // Dummy assignments so variables are always initialized
+            g_points_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+            reduce_params_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
         }
-        if timed { timing.gpu_reduce_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
-        // Read back all g_points
+        cb.commit();
+        cb.wait_until_completed();
+    } else {
+        g_points_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        reduce_params_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    }
+    if timed { timing.gpu_kernel_ms = t0.elapsed().as_secs_f64() * 1000.0; }
+
+    if use_pbpr && num_active > 0 {
+        // Read back all g_points (Jacobian → projective conversion)
         let t0 = Instant::now();
         let g_ptr = g_points_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
             let mut window_sum = G1::identity();
             for t in 0..num_reduce_threads {
                 let off = (i * num_reduce_threads + t) * 12;
-                let z_all_zero = unsafe {
-                    (*g_ptr.add(off + 8) | *g_ptr.add(off + 9)
-                     | *g_ptr.add(off + 10) | *g_ptr.add(off + 11)) == 0
-                };
-                if !z_all_zero {
-                    let g_point = unsafe {
-                        let p = g_ptr.add(off);
-                        G1 {
-                            x: Fq([*p, *p.add(1), *p.add(2), *p.add(3)]),
-                            y: Fq([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]),
-                            z: Fq([*p.add(8), *p.add(9), *p.add(10), *p.add(11)]),
-                        }
-                    };
+                if let Some(g_point) = unsafe { read_jacobian_point(g_ptr, off) } {
                     window_sum = window_sum + g_point;
                 }
             }
@@ -522,7 +587,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         }
         if timed { timing.cpu_reduce_ms = t0.elapsed().as_secs_f64() * 1000.0; }
     } else {
-        // CPU fallback: read back buckets and do summation-by-parts on CPU
+        // CPU fallback: read back buckets (Jacobian) and do summation-by-parts
         let t0 = Instant::now();
         let bucket_ptr = buckets_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
@@ -531,19 +596,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             let mut window_sum = G1::identity();
             for b in (0..num_buckets).rev() {
                 let off = base_off + b * 12;
-                let z_all_zero = unsafe {
-                    (*bucket_ptr.add(off + 8) | *bucket_ptr.add(off + 9)
-                     | *bucket_ptr.add(off + 10) | *bucket_ptr.add(off + 11)) == 0
-                };
-                if !z_all_zero {
-                    let bucket_point = unsafe {
-                        let p = bucket_ptr.add(off);
-                        G1 {
-                            x: Fq([*p, *p.add(1), *p.add(2), *p.add(3)]),
-                            y: Fq([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]),
-                            z: Fq([*p.add(8), *p.add(9), *p.add(10), *p.add(11)]),
-                        }
-                    };
+                if let Some(bucket_point) = unsafe { read_jacobian_point(bucket_ptr, off) } {
                     running = running + bucket_point;
                 }
                 window_sum = window_sum + running;
@@ -823,25 +876,13 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             cb.wait_until_completed();
         }
 
-        // Read back all g_points
+        // Read back all g_points (Jacobian → projective conversion)
         let g_ptr = g_points_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
             let mut window_sum = G1::identity();
             for t in 0..num_reduce_threads {
                 let off = (i * num_reduce_threads + t) * 12;
-                let z_all_zero = unsafe {
-                    (*g_ptr.add(off + 8) | *g_ptr.add(off + 9)
-                     | *g_ptr.add(off + 10) | *g_ptr.add(off + 11)) == 0
-                };
-                if !z_all_zero {
-                    let g_point = unsafe {
-                        let p = g_ptr.add(off);
-                        G1 {
-                            x: Fq([*p, *p.add(1), *p.add(2), *p.add(3)]),
-                            y: Fq([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]),
-                            z: Fq([*p.add(8), *p.add(9), *p.add(10), *p.add(11)]),
-                        }
-                    };
+                if let Some(g_point) = unsafe { read_jacobian_point(g_ptr, off) } {
                     window_sum = window_sum + g_point;
                 }
             }
@@ -855,19 +896,7 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             let mut window_sum = G1::identity();
             for b in (0..num_buckets).rev() {
                 let off = base_off + b * 12;
-                let z_all_zero = unsafe {
-                    (*bucket_ptr.add(off + 8) | *bucket_ptr.add(off + 9)
-                     | *bucket_ptr.add(off + 10) | *bucket_ptr.add(off + 11)) == 0
-                };
-                if !z_all_zero {
-                    let bucket_point = unsafe {
-                        let p = bucket_ptr.add(off);
-                        G1 {
-                            x: Fq([*p, *p.add(1), *p.add(2), *p.add(3)]),
-                            y: Fq([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]),
-                            z: Fq([*p.add(8), *p.add(9), *p.add(10), *p.add(11)]),
-                        }
-                    };
+                if let Some(bucket_point) = unsafe { read_jacobian_point(bucket_ptr, off) } {
                     running = running + bucket_point;
                 }
                 window_sum = window_sum + running;
@@ -1017,7 +1046,16 @@ fn build_scatter_table(
 /// 3. PBPR handles the larger bucket count efficiently on GPU
 ///
 /// Tuned for Apple Silicon (M4 Pro) with unified memory.
+/// Override with MSM_GPU_C=<value> for tuning experiments.
 fn get_optimal_c_gpu(n: usize) -> usize {
+    // Allow override via environment variable for tuning
+    if let Ok(val) = std::env::var("MSM_GPU_C") {
+        if let Ok(c) = val.parse::<usize>() {
+            if (8..=20).contains(&c) {
+                return c;
+            }
+        }
+    }
     let k = (n as f64).log2() as usize;
     match k {
         0..=13  => 10,
