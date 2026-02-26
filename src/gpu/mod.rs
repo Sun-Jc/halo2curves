@@ -40,20 +40,34 @@ static GPU_CTX: OnceLock<GpuContext> = OnceLock::new();
 
 pub(crate) fn gpu_ctx() -> &'static GpuContext {
     GPU_CTX.get_or_init(|| {
-        let device = Device::system_default().expect("No Metal GPU device found");
+        // Retry GPU device acquisition — paravirtual devices may be transiently unavailable
+        let device = {
+            let mut dev = None;
+            for attempt in 0..5 {
+                dev = Device::system_default();
+                if dev.is_some() { break; }
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+            dev.expect("No Metal GPU device found after 5 attempts")
+        };
         let queue = device.new_command_queue();
 
         let options = CompileOptions::new();
-        let library = device
-            .new_library_with_source(shader::SHADER_SOURCE, &options)
-            .expect("Failed to compile Metal shader");
+        let library = match device.new_library_with_source(shader::SHADER_SOURCE, &options) {
+            Ok(lib) => lib,
+            Err(e) => panic!("Failed to compile Metal shader: {}", e),
+        };
 
         let field_test_fn = library
             .get_function("test_field_ops", None)
             .expect("Missing test_field_ops kernel");
-        let field_test_pipeline = device
-            .new_compute_pipeline_state_with_function(&field_test_fn)
-            .expect("Failed to create field_test pipeline");
+        let field_test_pipeline = match device
+            .new_compute_pipeline_state_with_function(&field_test_fn) {
+                Ok(p) => p,
+                Err(e) => panic!("Failed to create field_test pipeline: {:?}", e),
+            };
 
         let field_addsub_fn = library
             .get_function("test_field_addsub", None)
@@ -251,35 +265,52 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     timing.c = c;
     timing.num_buckets = num_buckets;
 
-    // 1. Serialize scalars to bytes (parallelized with rayon)
-    let t0 = Instant::now();
-    let coeffs_bytes: Vec<_> = coeffs.par_iter().map(|s| s.to_repr()).collect();
-    if timed { timing.scalar_encode_ms = t0.elapsed().as_secs_f64() * 1000.0; }
+    // 1+2+3. Pipelined CPU work: scalar encode, base pack, scatter build
+    //
+    // Dependencies:
+    //   scatter_build depends on coeffs_bytes (from scalar encode)
+    //   base_pack is independent of scalar encode AND scatter build
+    //
+    // Strategy: Run base_pack on a background thread while scalar encode + scatter
+    // build run on the rayon pool. This overlaps the large memcpy (36-230ms) with
+    // all CPU computation, effectively hiding base_pack latency entirely.
+    //
+    // For k=24: saves ~230ms base_pack (runs concurrently with 38ms encode + 575ms scatter)
+    // For k=22: saves ~36ms base_pack (runs concurrently with 13ms encode + 97ms scatter)
 
-    // 2. Zero-copy base points
-    let t0 = Instant::now();
     assert_eq!(std::mem::size_of::<G1Affine>(), 64,
         "G1Affine must be 64 bytes for zero-copy GPU transfer");
     let bases_byte_len = n * std::mem::size_of::<G1Affine>();
-    let bases_buf = ctx.device.new_buffer(
-        bases_byte_len as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bases.as_ptr() as *const u8,
-            bases_buf.contents() as *mut u8,
-            bases_byte_len,
-        );
-    }
-    if timed { timing.base_pack_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     // Number of windows
     let num_bits = Fr::NUM_BITS as usize;
     let number_of_windows = num_bits / c + 1;
     timing.num_windows = number_of_windows;
 
-    // 3. Build ALL scatter tables in parallel (rayon)
+    // Allocate GPU buffer for bases
+    let bases_buf = ctx.device.new_buffer(
+        bases_byte_len as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    // Start base packing on background thread (pure memcpy, doesn't need rayon)
+    let bases_dst = bases_buf.contents() as usize; // usize is Send
+    let bases_src = bases.as_ptr() as usize;
+    let base_pack_handle = std::thread::spawn(move || {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bases_src as *const u8,
+                bases_dst as *mut u8,
+                bases_byte_len,
+            );
+        }
+    });
+
+    // Meanwhile: scalar encode + scatter build on rayon pool
+    let t0 = Instant::now();
+    let coeffs_bytes: Vec<_> = coeffs.par_iter().map(|s| s.to_repr()).collect();
+    if timed { timing.scalar_encode_ms = t0.elapsed().as_secs_f64() * 1000.0; }
+
     let t0 = Instant::now();
     let scatter_tables: Vec<_> = (0..number_of_windows)
         .into_par_iter()
@@ -287,10 +318,14 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         .collect();
     if timed { timing.scatter_build_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
+    // Wait for base packing to finish (should already be done since scatter is slower)
+    let t0 = Instant::now();
+    base_pack_handle.join().unwrap();
+    if timed { timing.base_pack_ms = t0.elapsed().as_secs_f64() * 1000.0; } // time waiting only
+
     // 4. Build concatenated GPU buffers for all-windows-in-one-dispatch
     let t0 = Instant::now();
 
-    // Count total scatter entries across all windows and identify non-empty windows
     let mut active_windows: Vec<usize> = Vec::new();
     let mut total_scatter_entries = 0usize;
     for w in 0..number_of_windows {
@@ -301,7 +336,6 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     }
     let num_active = active_windows.len();
 
-    // Compute per-window metadata and buffer sizes
     let total_offsets = num_active * (num_buckets + 1);
     let total_bucket_slots = num_active * num_buckets;
 
@@ -310,7 +344,6 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     let buckets_buf_bytes = (total_bucket_slots.max(1) * 24 * 4) as u64;
     let params_buf_bytes  = (num_active.max(1) * 3 * 4) as u64;
 
-    // Diagnostic logging only when timed (avoids hot-path overhead)
     if timed {
         let max_buf_len = ctx.device.max_buffer_length();
         let total_gpu_bytes = (bases_byte_len as u64) + scatter_buf_bytes + offsets_buf_bytes + buckets_buf_bytes + params_buf_bytes;
@@ -324,38 +357,16 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             offsets_buf_bytes as f64 / (1u64 << 30) as f64,
             buckets_buf_bytes as f64 / (1u64 << 30) as f64,
             total_gpu_bytes as f64 / (1u64 << 30) as f64);
-        for (name, size) in [("bases_buf", bases_byte_len as u64), ("scatter_buf", scatter_buf_bytes), ("buckets_buf", buckets_buf_bytes)] {
-            if size > max_buf_len {
-                eprintln!("[msm_gpu] *** {name} ({:.2} GB) EXCEEDS Metal limit ({:.2} GB) ***",
-                    size as f64 / (1u64 << 30) as f64, max_buf_len as f64 / (1u64 << 30) as f64);
-            }
-        }
     }
 
-    // Debug-only safety checks (compiled out in release builds)
     debug_assert!(total_scatter_entries <= u32::MAX as usize,
         "msm_gpu: total_scatter_entries ({total_scatter_entries}) exceeds u32::MAX");
 
-    // Allocate Metal buffers directly — write scatter/offsets data straight into
-    // shared memory, avoiding intermediate Vec allocations + double-copy.
-    let scatter_buf = ctx.device.new_buffer(
-        scatter_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let offsets_buf = ctx.device.new_buffer(
-        offsets_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let buckets_buf = ctx.device.new_buffer(
-        buckets_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let window_params_buf = ctx.device.new_buffer(
-        params_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let scatter_buf = ctx.device.new_buffer(scatter_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let offsets_buf = ctx.device.new_buffer(offsets_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let buckets_buf = ctx.device.new_buffer(buckets_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let window_params_buf = ctx.device.new_buffer(params_buf_bytes, MTLResourceOptions::StorageModeShared);
 
-    // Write data directly into Metal shared memory buffers
     let scatter_dst = scatter_buf.contents() as *mut u32;
     let offsets_dst = offsets_buf.contents() as *mut u32;
     let params_dst = window_params_buf.contents() as *mut u32;
@@ -366,14 +377,12 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         let offsets_start = (i * (num_buckets + 1)) as u32;
         let buckets_start = (i * num_buckets) as u32;
 
-        // Write window_params directly
         unsafe {
             *params_dst.add(i * 3) = scatter_cursor;
             *params_dst.add(i * 3 + 1) = offsets_start;
             *params_dst.add(i * 3 + 2) = buckets_start;
         }
 
-        // Copy offsets directly into Metal buffer
         unsafe {
             std::ptr::copy_nonoverlapping(
                 offsets.as_ptr(),
@@ -382,7 +391,6 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             );
         }
 
-        // Copy packed scatter entries directly into Metal buffer
         if !entries.is_empty() {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -395,8 +403,6 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         scatter_cursor += entries.len() as u32;
     }
 
-    // No need to initialize bucket slots — the GPU kernel writes identity for empty
-    // buckets and starts from identity for non-empty ones.
     if timed { timing.gpu_upload_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     // 5. Dispatch bucket_accumulate_all kernel (single dispatch for ALL windows)
@@ -424,31 +430,20 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     if timed { timing.gpu_kernel_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     // 6. PBPR or CPU reduction
-    //    Use PBPR whenever we have enough buckets for at least 2 threads with bpt >= 2.
     let use_pbpr = num_buckets >= 256;
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
             .max_total_threads_per_threadgroup() as usize;
-        // Aim for ~8 buckets per thread: good parallelism without starving threads
-        let ideal = (num_buckets / 8).min(max_tg).max(1);
-        // Round down to power of 2 for even division
+        let ideal = (num_buckets / 64).max(2).min(max_tg);
         let mut t = 1;
         while t * 2 <= ideal && num_buckets % (t * 2) == 0 { t *= 2; }
         t
     } else { 0 };
 
-    // Per-window results: g_points for each active window
-    // Stored in window_results[window_index] = Vec<G1> of g_points per PBPR thread
-    // or the full summation-by-parts result for CPU mode.
-    //
-    // We need per-window results to combine with Horner's method.
-
     let t0 = Instant::now();
-    // For each active window, produce a single G1 point via PBPR or CPU reduction
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
 
     if use_pbpr && num_active > 0 {
-        // GPU PBPR for all windows at once
         let g_points_buf = ctx.device.new_buffer(
             (num_active * num_reduce_threads * 24 * 4) as u64,
             MTLResourceOptions::StorageModeShared,
@@ -463,15 +458,16 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             *p.add(1) = num_reduce_threads as u32;
         }
 
-        // Stage 1: all windows
+        // Stage 1 + Stage 2 in a single command buffer for lower dispatch overhead
         {
             let cb = ctx.queue.new_command_buffer();
+
+            // Stage 1
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
             enc.set_buffer(2, Some(&params_buf), 0);
-
             let max_tg = ctx
                 .bucket_reduce_stage1_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -479,19 +475,13 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-        }
 
-        // Stage 2: all windows
-        {
-            let cb = ctx.queue.new_command_buffer();
+            // Stage 2 (same command buffer — Metal guarantees sequential execution)
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
             enc.set_buffer(2, Some(&params_buf), 0);
-
             let max_tg = ctx
                 .bucket_reduce_stage2_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -499,6 +489,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
+
             cb.commit();
             cb.wait_until_completed();
         }
@@ -535,8 +526,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         let t0 = Instant::now();
         let bucket_ptr = buckets_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
-            let base_off = i * num_buckets * 12; // 12 u64s per Jacobian point
-            // Summation-by-parts: running = B[num_buckets-1], sum += running, running += B[num_buckets-2], ...
+            let base_off = i * num_buckets * 12;
             let mut running = G1::identity();
             let mut window_sum = G1::identity();
             for b in (0..num_buckets).rev() {
@@ -564,11 +554,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     }
 
     // 7. Combine window results using Horner's method
-    //    total = Σ window_result[w] * 2^{w*c}
-    //    Done via iterating from highest window down:
-    //    acc = ((...(window[W-1] * 2^c + window[W-2]) * 2^c + ...) * 2^c + window[0])
     let t0 = Instant::now();
-    // Build a lookup: window_index -> G1 point
     let mut window_map: Vec<Option<G1>> = vec![None; number_of_windows];
     for (w, pt) in window_results {
         window_map[w] = Some(pt);
@@ -595,11 +581,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
 /// `k·P = k1·P + k2·phi(P)` where `phi(P) = (zeta·x, y)`.
 ///
 /// This halves the number of Pippenger windows at the cost of doubling
-/// the point count per window. Combined with all-windows-in-one-dispatch,
-/// the GPU does a single bucket accumulation + single PBPR reduction across
-/// all windows in just two kernel launches (instead of 2×W per-window launches).
-///
-/// Falls back to `msm_gpu` for small inputs (< 2^14 points).
+/// the point count per window.
 pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     use rayon::prelude::*;
 
@@ -614,13 +596,11 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let ctx = gpu_ctx();
 
     // 1. GLV scalar decomposition: k = k1 + lambda * k2
-    //    decompose_scalar returns (|k1|, k1_neg, |k2|, k2_neg) with k1,k2 ~128 bits
     let decomposed: Vec<(u128, bool, u128, bool)> = coeffs
         .par_iter()
         .map(|s| G1::decompose_scalar(s))
         .collect();
 
-    // Convert k1, k2 to byte representations for Booth encoding
     let k1_bytes: Vec<[u8; 16]> = decomposed
         .iter()
         .map(|(k1, _, _, _): &(u128, bool, u128, bool)| k1.to_le_bytes())
@@ -631,70 +611,72 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
         .map(|(_, _, k2, _): &(u128, bool, u128, bool)| k2.to_le_bytes())
         .collect();
 
-    // Sign flags: true = positive contribution to MSM
     let k1_signs: Vec<bool> = decomposed.iter().map(|(_, neg, _, _)| !neg).collect();
     let k2_signs: Vec<bool> = decomposed.iter().map(|(_, _, _, neg)| *neg).collect();
 
-    // 2. Pack 2n affine bases into GPU buffer (parallelized)
-    //    Layout: [P_0, P_1, ..., P_{n-1}, phi(P_0), phi(P_1), ..., phi(P_{n-1})]
-    //    Endomorphism: phi(P) = (zeta * x, y) where zeta is cube root of unity in Fq.
-    //    Both memcpy of original points and zeta-mul are parallelized with rayon.
+    // 2+3+4. Pipeline: base packing overlaps with scatter build
+    //
+    // Base packing: computes endomorphism points + copies to GPU buffer (reads `bases`)
+    // Scatter build: Booth-encodes half-scalars, builds CSR tables (reads k1_bytes, k2_bytes)
+    // These are independent — overlap them with rayon::join.
+
     let zeta = <Fq as WithSmallOrderMulGroup<3>>::ZETA;
     let total_points = 2 * n;
-    let bases_byte_len = total_points * 16 * 4; // 16 u32s per affine point
+    let bases_byte_len = total_points * 16 * 4;
     let bases_buf = ctx.device.new_buffer(
         bases_byte_len as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    {
-        let dst_ptr = bases_buf.contents() as usize; // usize for Send
-        // Parallel over chunks for cache-friendliness
-        bases.par_chunks(1024).enumerate().for_each(|(chunk_idx, chunk)| {
-            let base_i = chunk_idx * 1024;
-            let dst = dst_ptr as *mut u32;
-            for (j, base) in chunk.iter().enumerate() {
-                let i = base_i + j;
-                let coords = base.coordinates().unwrap();
-                let x_limbs = u64x4_to_u32x8(&coords.x().0);
-                let y_limbs = u64x4_to_u32x8(&coords.y().0);
-                let off = i * 16;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(x_limbs.as_ptr(), dst.add(off), 8);
-                    std::ptr::copy_nonoverlapping(y_limbs.as_ptr(), dst.add(off + 8), 8);
-                }
 
-                // Endomorphism base: phi(P) = (zeta * x, y)
-                let endo_x = *coords.x() * zeta;
-                let endo_x_limbs = u64x4_to_u32x8(&endo_x.0);
-                let off2 = (n + i) * 16;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(endo_x_limbs.as_ptr(), dst.add(off2), 8);
-                    std::ptr::copy_nonoverlapping(y_limbs.as_ptr(), dst.add(off2 + 8), 8);
-                }
-            }
-        });
-    }
-
-    // 3. Determine window parameters for ~128-bit scalars
-    //    Use n (not 2n) for c selection: the scatter table has 2n entries per window
-    //    but we want c tuned to the actual MSM density, not the inflated point count.
+    // Window parameters for ~128-bit scalars
     let half_bits = 128usize;
     let c = get_optimal_c_gpu(n);
     let num_buckets = 1usize << (c - 1);
     let number_of_windows = half_bits / c + 1;
 
-    // 4. Build ALL scatter tables in parallel
-    let scatter_tables: Vec<_> = (0..number_of_windows)
-        .into_par_iter()
-        .map(|w| build_scatter_table_glv(
-            w, c, num_buckets, n,
-            &k1_bytes, &k1_signs,
-            &k2_bytes, &k2_signs,
-        ))
-        .collect();
+    // Run base packing and scatter building concurrently
+    let (_, scatter_tables) = rayon::join(
+        || {
+            // Pack 2n affine bases into GPU buffer (parallelized)
+            let dst_ptr = bases_buf.contents() as usize;
+            bases.par_chunks(1024).enumerate().for_each(|(chunk_idx, chunk)| {
+                let base_i = chunk_idx * 1024;
+                let dst = dst_ptr as *mut u32;
+                for (j, base) in chunk.iter().enumerate() {
+                    let i = base_i + j;
+                    let coords = base.coordinates().unwrap();
+                    let x_limbs = u64x4_to_u32x8(&coords.x().0);
+                    let y_limbs = u64x4_to_u32x8(&coords.y().0);
+                    let off = i * 16;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(x_limbs.as_ptr(), dst.add(off), 8);
+                        std::ptr::copy_nonoverlapping(y_limbs.as_ptr(), dst.add(off + 8), 8);
+                    }
 
-    // 5. Build concatenated GPU buffers for all-windows-in-one-dispatch
-    //    Same architecture as msm_gpu_inner: flat buffers + window_params metadata
+                    let endo_x = *coords.x() * zeta;
+                    let endo_x_limbs = u64x4_to_u32x8(&endo_x.0);
+                    let off2 = (n + i) * 16;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(endo_x_limbs.as_ptr(), dst.add(off2), 8);
+                        std::ptr::copy_nonoverlapping(y_limbs.as_ptr(), dst.add(off2 + 8), 8);
+                    }
+                }
+            });
+        },
+        || {
+            // Build ALL scatter tables in parallel
+            (0..number_of_windows)
+                .into_par_iter()
+                .map(|w| build_scatter_table_glv(
+                    w, c, num_buckets, n,
+                    &k1_bytes, &k1_signs,
+                    &k2_bytes, &k2_signs,
+                ))
+                .collect::<Vec<_>>()
+        },
+    );
+
+    // 5. Build concatenated GPU buffers
     let mut active_windows: Vec<usize> = Vec::new();
     let mut total_scatter_entries = 0usize;
     for w in 0..number_of_windows {
@@ -713,30 +695,13 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let buckets_buf_bytes = (total_bucket_slots.max(1) * 24 * 4) as u64;
     let params_buf_bytes  = (num_active.max(1) * 3 * 4) as u64;
 
-    // Debug-only safety checks (compiled out in release builds)
-    debug_assert!(total_scatter_entries <= u32::MAX as usize,
-        "msm_gpu_glv: total_scatter_entries exceeds u32::MAX");
-    debug_assert!((2 * n) <= (1usize << 31),
-        "msm_gpu_glv: 2*n exceeds u31 range for base_idx packing");
+    debug_assert!(total_scatter_entries <= u32::MAX as usize);
+    debug_assert!((2 * n) <= (1usize << 31));
 
-    // Allocate Metal buffers directly — write scatter/offsets data straight into
-    // shared memory, avoiding intermediate Vec allocations + double-copy.
-    let scatter_buf = ctx.device.new_buffer(
-        scatter_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let offsets_buf = ctx.device.new_buffer(
-        offsets_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let buckets_buf = ctx.device.new_buffer(
-        buckets_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let window_params_buf = ctx.device.new_buffer(
-        params_buf_bytes,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let scatter_buf = ctx.device.new_buffer(scatter_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let offsets_buf = ctx.device.new_buffer(offsets_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let buckets_buf = ctx.device.new_buffer(buckets_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let window_params_buf = ctx.device.new_buffer(params_buf_bytes, MTLResourceOptions::StorageModeShared);
 
     let scatter_dst = scatter_buf.contents() as *mut u32;
     let offsets_dst = offsets_buf.contents() as *mut u32;
@@ -774,7 +739,7 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
         scatter_cursor += entries.len() as u32;
     }
 
-    // 6. Dispatch bucket_accumulate_all kernel (single dispatch for ALL windows)
+    // 6. Dispatch bucket_accumulate_all kernel
     if num_active > 0 {
         let cb = ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -796,12 +761,12 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
         cb.wait_until_completed();
     }
 
-    // 7. PBPR or CPU reduction (same logic as msm_gpu_inner)
+    // 7. PBPR or CPU reduction
     let use_pbpr = num_buckets >= 256;
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
             .max_total_threads_per_threadgroup() as usize;
-        let ideal = (num_buckets / 8).min(max_tg).max(1);
+        let ideal = (num_buckets / 64).max(2).min(max_tg);
         let mut t = 1;
         while t * 2 <= ideal && num_buckets % (t * 2) == 0 { t *= 2; }
         t
@@ -810,7 +775,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
 
     if use_pbpr && num_active > 0 {
-        // GPU PBPR for all windows at once
         let g_points_buf = ctx.device.new_buffer(
             (num_active * num_reduce_threads * 24 * 4) as u64,
             MTLResourceOptions::StorageModeShared,
@@ -825,15 +789,15 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             *p.add(1) = num_reduce_threads as u32;
         }
 
-        // Stage 1: all windows
+        // Stage 1 + Stage 2 in a single command buffer
         {
             let cb = ctx.queue.new_command_buffer();
+
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
             enc.set_buffer(2, Some(&params_buf), 0);
-
             let max_tg = ctx
                 .bucket_reduce_stage1_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -841,19 +805,12 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-        }
 
-        // Stage 2: all windows
-        {
-            let cb = ctx.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
             enc.set_buffer(1, Some(&g_points_buf), 0);
             enc.set_buffer(2, Some(&params_buf), 0);
-
             let max_tg = ctx
                 .bucket_reduce_stage2_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -861,6 +818,7 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
+
             cb.commit();
             cb.wait_until_completed();
         }
@@ -890,7 +848,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             window_results.push((w, window_sum));
         }
     } else {
-        // CPU fallback: read back buckets and do summation-by-parts on CPU
         let bucket_ptr = buckets_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
             let base_off = i * num_buckets * 12;
@@ -963,13 +920,11 @@ fn build_scatter_table_glv(
     for i in 0..n {
         let idx1 = get_booth_index(window, c, &k1_bytes[i]);
         if idx1 != 0 {
-            let buck = idx1.unsigned_abs() as usize - 1;
-            counts[buck] += 1;
+            counts[idx1.unsigned_abs() as usize - 1] += 1;
         }
         let idx2 = get_booth_index(window, c, &k2_bytes[i]);
         if idx2 != 0 {
-            let buck = idx2.unsigned_abs() as usize - 1;
-            counts[buck] += 1;
+            counts[idx2.unsigned_abs() as usize - 1] += 1;
         }
     }
 
@@ -980,15 +935,13 @@ fn build_scatter_table_glv(
     }
     let total = bucket_offsets[num_buckets] as usize;
 
-    // Second pass: fill scatter entries (packed: base_idx | sign<<31)
+    // Second pass: fill scatter entries
     let mut scatter_entries = vec![0u32; total];
     let mut write_pos = bucket_offsets[..num_buckets].to_vec();
 
     for i in 0..n {
-        // k1 contribution: base point index = i
         let idx1 = get_booth_index(window, c, &k1_bytes[i]);
         if idx1 != 0 {
-            // Effective sign: Booth sign XOR GLV k1 negation
             let booth_positive = idx1.is_positive();
             let effective_positive = booth_positive ^ (!k1_signs[i]);
             let buck = idx1.unsigned_abs() as usize - 1;
@@ -997,7 +950,6 @@ fn build_scatter_table_glv(
             write_pos[buck] += 1;
         }
 
-        // k2 contribution: base point index = n + i (endomorphism base)
         let idx2 = get_booth_index(window, c, &k2_bytes[i]);
         if idx2 != 0 {
             let booth_positive = idx2.is_positive();
@@ -1013,24 +965,22 @@ fn build_scatter_table_glv(
 }
 
 /// Build CSR scatter table for one Pippenger window.
-///
-/// Returns `(bucket_offsets, scatter_entries)` where:
-/// - `bucket_offsets[i]` = start index in `scatter_entries` for bucket `i`
-/// - `scatter_entries[j]` = packed u32: `base_idx | (sign << 31)`
+/// The counting and filling are sequential within each window, but windows
+/// themselves are built in parallel at the call site.
 fn build_scatter_table(
     window: usize,
     c: usize,
     num_buckets: usize,
-    coeffs_bytes: &[impl AsRef<[u8]>],
+    coeffs_bytes: &[impl AsRef<[u8]> + Sync],
 ) -> (Vec<u32>, Vec<u32>) {
+    let n = coeffs_bytes.len();
+
     // First pass: count entries per bucket
     let mut counts = vec![0u32; num_buckets];
-    for (base_idx, coeff) in coeffs_bytes.iter().enumerate() {
+    for coeff in coeffs_bytes.iter() {
         let idx = get_booth_index(window, c, coeff.as_ref());
         if idx != 0 {
-            let buck = idx.unsigned_abs() as usize - 1;
-            counts[buck] += 1;
-            let _ = base_idx; // used in second pass
+            counts[idx.unsigned_abs() as usize - 1] += 1;
         }
     }
 
@@ -1043,7 +993,7 @@ fn build_scatter_table(
 
     // Second pass: fill scatter entries (packed: base_idx | sign<<31)
     let mut scatter_entries = vec![0u32; total];
-    let mut write_pos = bucket_offsets[..num_buckets].to_vec(); // current write position per bucket
+    let mut write_pos = bucket_offsets[..num_buckets].to_vec();
 
     for (base_idx, coeff) in coeffs_bytes.iter().enumerate() {
         let idx = get_booth_index(window, c, coeff.as_ref());
@@ -1061,10 +1011,19 @@ fn build_scatter_table(
 
 /// Optimal Pippenger window size for GPU.
 ///
-/// Uses the same empirically-tuned heuristic as the CPU MSM.
-/// Larger c = more buckets = more GPU threads, but also more memory.
-/// The CPU heuristic was validated against the GPU's all-windows-in-one-dispatch
-/// architecture and found to produce equivalent or better results.
+/// GPU prefers larger windows (fewer dispatches) because:
+/// 1. Bucket accumulation is GPU-parallel (more buckets = more parallelism)
+/// 2. Fewer windows = fewer kernel launches (each has fixed overhead)
+/// 3. PBPR handles the larger bucket count efficiently on GPU
+///
+/// Tuned for Apple Silicon (M4 Pro) with unified memory.
 fn get_optimal_c_gpu(n: usize) -> usize {
-    crate::msm::get_optimal_c(n)
+    let k = (n as f64).log2() as usize;
+    match k {
+        0..=13  => 10,
+        14..=17 => 13,
+        18..=19 => 15,
+        20..=24 => 16,
+        _       => 18,
+    }
 }

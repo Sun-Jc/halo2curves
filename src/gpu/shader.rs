@@ -1,6 +1,12 @@
 //! Metal shader source for GPU-accelerated MSM.
 //!
 //! Contains all MSL kernels as a Rust string constant, compiled at runtime.
+//!
+//! Optimizations vs. naive version:
+//! - fq_mul/fq_add/fq_sub support aliased output (in-place), eliminating fq_copy overhead
+//! - projective_madd rewritten to minimize temporaries and copies
+//! - bucket_accumulate_all: first point loaded directly as accumulator (no identity madd)
+//! - fq_neg made branchless
 
 pub(crate) const SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -25,10 +31,13 @@ constant uint FQ_ONE[8] = {
     0x7879462cu, 0x666ea36fu, 0x9a07df2fu, 0x0e0a77c1u
 };
 
+// Zero
+constant uint FQ_ZERO[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
 // Typedef for clarity
 typedef uint Fq[8];
 
-// ---- Modular addition: c = a + b mod p ----
+// ---- Modular addition: c = a + b mod p (supports c aliasing a or b) ----
 inline void fq_add(thread const uint* a, thread const uint* b, thread uint* c) {
     ulong carry = 0;
     uint sum[8];
@@ -45,14 +54,13 @@ inline void fq_add(thread const uint* a, thread const uint* b, thread uint* c) {
         diff[i] = uint(d & 0xFFFFFFFFul);
         borrow = (d >> 63) & 1;
     }
-    // If carry >= borrow, result >= p, use diff; else use sum
     uint use_diff = uint((carry >= borrow) ? 1 : 0);
     for (int i = 0; i < 8; i++) {
         c[i] = use_diff ? diff[i] : sum[i];
     }
 }
 
-// ---- Modular subtraction: c = a - b mod p ----
+// ---- Modular subtraction: c = a - b mod p (supports c aliasing a or b) ----
 inline void fq_sub(thread const uint* a, thread const uint* b, thread uint* c) {
     ulong borrow = 0;
     uint diff[8];
@@ -61,7 +69,6 @@ inline void fq_sub(thread const uint* a, thread const uint* b, thread uint* c) {
         diff[i] = uint(d & 0xFFFFFFFFul);
         borrow = (d >> 63) & 1;
     }
-    // If borrow, add modulus back
     ulong carry = 0;
     for (int i = 0; i < 8; i++) {
         ulong s = ulong(diff[i]) + (borrow ? ulong(FQ_MOD[i]) : 0ul) + carry;
@@ -70,32 +77,27 @@ inline void fq_sub(thread const uint* a, thread const uint* b, thread uint* c) {
     }
 }
 
-// ---- Modular negation: c = -a mod p (= p - a if a != 0, else 0) ----
+// ---- Modular negation: c = -a mod p (branchless) ----
 inline void fq_neg(thread const uint* a, thread uint* c) {
-    // Check if a == 0
-    uint is_zero = 1;
-    for (int i = 0; i < 8; i++) {
-        if (a[i] != 0) { is_zero = 0; break; }
-    }
-    if (is_zero) {
-        for (int i = 0; i < 8; i++) c[i] = 0;
-        return;
-    }
+    uint is_nonzero = 0;
+    for (int i = 0; i < 8; i++) is_nonzero |= a[i];
+    // mask: all 1s if nonzero, all 0s if zero
+    uint mask = (is_nonzero != 0) ? 0xFFFFFFFFu : 0u;
+
     ulong borrow = 0;
     for (int i = 0; i < 8; i++) {
-        ulong d = ulong(FQ_MOD[i]) - ulong(a[i]) - borrow;
+        ulong d = ulong(FQ_MOD[i] & mask) - ulong(a[i]) - borrow;
         c[i] = uint(d & 0xFFFFFFFFul);
         borrow = (d >> 63) & 1;
     }
 }
 
 // ---- Montgomery multiplication: c = a * b * R^{-1} mod p (CIOS, 32-bit) ----
+// Supports c aliasing a or b (result is computed in t[] then written to c at the end).
 inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
-    // CIOS (Coarsely Integrated Operand Scanning)
     ulong t[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     for (int i = 0; i < 8; i++) {
-        // Step 1: t += a[0..8] * b[i]
         ulong carry = 0;
         for (int j = 0; j < 8; j++) {
             ulong prod = ulong(a[j]) * ulong(b[i]) + t[j] + carry;
@@ -104,13 +106,11 @@ inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
         }
         t[8] += carry;
 
-        // Step 2: Montgomery reduction
         uint m = uint(t[0] & 0xFFFFFFFFul) * FQ_INV;
-        carry = 0;
-        ulong prod0 = ulong(m) * ulong(FQ_MOD[0]) + t[0];
-        carry = prod0 >> 32;
+        ulong um = ulong(m);
+        carry = (um * ulong(FQ_MOD[0]) + t[0]) >> 32;
         for (int j = 1; j < 8; j++) {
-            ulong prod = ulong(m) * ulong(FQ_MOD[j]) + t[j] + carry;
+            ulong prod = um * ulong(FQ_MOD[j]) + t[j] + carry;
             t[j - 1] = prod & 0xFFFFFFFFul;
             carry = prod >> 32;
         }
@@ -127,7 +127,6 @@ inline void fq_mul(thread const uint* a, thread const uint* b, thread uint* c) {
         diff[i] = uint(d & 0xFFFFFFFFul);
         borrow = (d >> 63) & 1;
     }
-    // If no borrow (t >= p), use diff; else use t
     uint use_t = uint(borrow);
     for (int i = 0; i < 8; i++) {
         c[i] = use_t ? uint(t[i] & 0xFFFFFFFFul) : diff[i];
@@ -139,17 +138,16 @@ inline void fq_sqr(thread const uint* a, thread uint* c) {
     fq_mul(a, a, c);
 }
 
-// ---- Double: c = a + a mod p ----
+// ---- Double: c = 2*a mod p (supports c aliasing a) ----
 inline void fq_dbl(thread const uint* a, thread uint* c) {
     fq_add(a, a, c);
 }
 
 // ---- Check if field element is zero ----
 inline bool fq_is_zero(thread const uint* a) {
-    for (int i = 0; i < 8; i++) {
-        if (a[i] != 0) return false;
-    }
-    return true;
+    uint v = 0;
+    for (int i = 0; i < 8; i++) v |= a[i];
+    return v == 0;
 }
 
 // ---- Copy ----
@@ -177,29 +175,27 @@ inline void fq_store(thread const uint* src, device uint* dst) {
 // Curve: y² = x³ + b, where b = 3 for BN254 G1, so 3b = 9
 
 // mul_by_3b(x) = 9*x = 8*x + x (matching halo2curves BN256 G1 specialization)
+// Supports c aliasing a.
 inline void fq_mul_by_3b(thread const uint* a, thread uint* c) {
-    uint t1[8], t2[8], t3[8];
+    uint t1[8], t2[8];
     fq_dbl(a, t1);      // 2x
     fq_dbl(t1, t2);     // 4x
-    fq_dbl(t2, t3);     // 8x
-    fq_add(t3, a, c);   // 9x
+    fq_dbl(t2, t1);     // 8x
+    fq_add(t1, a, c);   // 9x
 }
 
 // ---- Mixed addition: R = P + Q, P=(X1:Y1:Z1) projective, Q=(x2,y2) affine ----
 // Algorithm 8, https://eprint.iacr.org/2015/1060.pdf (a=0 case)
-// This is a COMPLETE addition formula — handles all cases including
-// doubling, identity, and P+(-P) without branches.
-// IMPORTANT: When Q is identity (affine 0,0), caller must handle separately
-// since this formula assumes Q is a valid non-identity affine point.
+// Complete addition formula — handles all cases including doubling, identity.
+// IMPORTANT: When Q is identity (affine 0,0), caller must handle separately.
+// OPTIMIZED: All fq_mul/fq_add/fq_sub support aliased output, eliminating fq_copy.
 inline void projective_madd(
-    thread const uint* x1, thread const uint* y1, thread const uint* z1,  // Projective input P
-    thread const uint* x2, thread const uint* y2,                          // Affine input Q
-    thread uint* x3, thread uint* y3, thread uint* z3                      // Projective output
+    thread const uint* x1, thread const uint* y1, thread const uint* z1,
+    thread const uint* x2, thread const uint* y2,
+    thread uint* x3, thread uint* y3, thread uint* z3
 ) {
     uint t0[8], t1[8], t2[8], t3[8], t4[8];
-    uint tmp[8], tmp2[8];
 
-    // Algorithm 8 (a=0), eprint.iacr.org/2015/1060.pdf:
     // t0 = X1 * x2
     fq_mul(x1, x2, t0);
     // t1 = Y1 * y2
@@ -208,216 +204,126 @@ inline void projective_madd(
     fq_add(x2, y2, t3);
     // t4 = X1 + Y1
     fq_add(x1, y1, t4);
-    // t3 = t3 * t4
-    fq_mul(t3, t4, tmp);
-    fq_copy(tmp, t3);
+    // t3 = t3 * t4 (alias-safe)
+    fq_mul(t3, t4, t3);
     // t4 = t0 + t1
     fq_add(t0, t1, t4);
-    // t3 = t3 - t4
-    fq_sub(t3, t4, tmp);
-    fq_copy(tmp, t3);
+    // t3 = t3 - t4 (alias-safe)
+    fq_sub(t3, t4, t3);
     // t4 = y2 * Z1
     fq_mul(y2, z1, t4);
-    // t4 = t4 + Y1
-    fq_add(t4, y1, tmp);
-    fq_copy(tmp, t4);
+    // t4 = t4 + Y1 (alias-safe)
+    fq_add(t4, y1, t4);
     // y3 = x2 * Z1
     fq_mul(x2, z1, y3);
-    // y3 = y3 + X1
-    fq_add(y3, x1, tmp);
-    fq_copy(tmp, y3);
+    // y3 = y3 + X1 (alias-safe)
+    fq_add(y3, x1, y3);
     // x3 = t0 + t0
     fq_dbl(t0, x3);
-    // t0 = x3 + t0
-    fq_add(x3, t0, tmp);
-    fq_copy(tmp, t0);
+    // t0 = x3 + t0 (alias-safe)
+    fq_add(x3, t0, t0);
     // t2 = mul_by_3b(Z1)
     fq_mul_by_3b(z1, t2);
     // z3 = t1 + t2
     fq_add(t1, t2, z3);
-    // t1 = t1 - t2
-    fq_sub(t1, t2, tmp);
-    fq_copy(tmp, t1);
-    // y3 = mul_by_3b(y3)
-    fq_mul_by_3b(y3, tmp);
-    fq_copy(tmp, y3);
+    // t1 = t1 - t2 (alias-safe)
+    fq_sub(t1, t2, t1);
+    // y3 = mul_by_3b(y3) (alias-safe)
+    fq_mul_by_3b(y3, y3);
     // x3 = t4 * y3
     fq_mul(t4, y3, x3);
     // t2 = t3 * t1
     fq_mul(t3, t1, t2);
-    // x3 = t2 - x3
-    fq_sub(t2, x3, tmp);
-    fq_copy(tmp, x3);
-    // y3 = y3 * t0
-    fq_mul(y3, t0, tmp);
-    fq_copy(tmp, y3);
-    // t1 = t1 * z3
-    fq_mul(t1, z3, tmp);
-    fq_copy(tmp, t1);
-    // y3 = t1 + y3
-    fq_add(t1, y3, tmp);
-    fq_copy(tmp, y3);
-    // t0 = t0 * t3
-    fq_mul(t0, t3, tmp);
-    fq_copy(tmp, t0);
-    // z3 = z3 * t4
-    fq_mul(z3, t4, tmp);
-    fq_copy(tmp, z3);
-    // z3 = z3 + t0
-    fq_add(z3, t0, tmp);
-    fq_copy(tmp, z3);
+    // x3 = t2 - x3 (alias-safe)
+    fq_sub(t2, x3, x3);
+    // y3 = y3 * t0 (alias-safe)
+    fq_mul(y3, t0, y3);
+    // t1 = t1 * z3 (alias-safe)
+    fq_mul(t1, z3, t1);
+    // y3 = t1 + y3 (alias-safe)
+    fq_add(t1, y3, y3);
+    // t0 = t0 * t3 (alias-safe)
+    fq_mul(t0, t3, t0);
+    // z3 = z3 * t4 (alias-safe)
+    fq_mul(z3, t4, z3);
+    // z3 = z3 + t0 (alias-safe)
+    fq_add(z3, t0, z3);
 }
 
 // ---- Full projective addition: R = P + Q, both projective ----
 // Algorithm 1, https://eprint.iacr.org/2015/1060.pdf (a=0 case)
-// Complete addition formula — handles all cases without branches.
+// NOTE: x3/y3/z3 MUST NOT alias x1/y1/z1 or x2/y2/z2 — x3/y3 are used as
+// temporary storage before the final result is computed.
+// Individual fq_mul/fq_add/fq_sub are alias-safe (for temporaries t0-t4).
 inline void projective_add(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread const uint* x2, thread const uint* y2, thread const uint* z2,
     thread uint* x3, thread uint* y3, thread uint* z3
 ) {
     uint t0[8], t1[8], t2[8], t3[8], t4[8];
-    uint tmp[8];
 
-    // t0 = X1 * X2
-    fq_mul(x1, x2, t0);
-    // t1 = Y1 * Y2
-    fq_mul(y1, y2, t1);
-    // t2 = Z1 * Z2
-    fq_mul(z1, z2, t2);
-    // t3 = X1 + Y1
-    fq_add(x1, y1, t3);
-    // t4 = X2 + Y2
-    fq_add(x2, y2, t4);
-    // t3 = t3 * t4
-    fq_mul(t3, t4, tmp);
-    fq_copy(tmp, t3);
-    // t4 = t0 + t1
-    fq_add(t0, t1, t4);
-    // t3 = t3 - t4  (= X1*Y2 + X2*Y1)
-    fq_sub(t3, t4, tmp);
-    fq_copy(tmp, t3);
-    // t4 = Y1 + Z1
-    fq_add(y1, z1, t4);
-    // x3 = Y2 + Z2  (temporary)
-    fq_add(y2, z2, x3);
-    // t4 = t4 * x3
-    fq_mul(t4, x3, tmp);
-    fq_copy(tmp, t4);
-    // x3 = t1 + t2
-    fq_add(t1, t2, x3);
-    // t4 = t4 - x3  (= Y1*Z2 + Y2*Z1)
-    fq_sub(t4, x3, tmp);
-    fq_copy(tmp, t4);
-    // x3 = X1 + Z1
-    fq_add(x1, z1, x3);
-    // y3 = X2 + Z2
-    fq_add(x2, z2, y3);
-    // x3 = x3 * y3
-    fq_mul(x3, y3, tmp);
-    fq_copy(tmp, x3);
-    // y3 = t0 + t2
-    fq_add(t0, t2, y3);
-    // y3 = x3 - y3  (= X1*Z2 + X2*Z1)
-    fq_sub(x3, y3, tmp);
-    fq_copy(tmp, y3);
-    // x3 = t0 + t0
-    fq_dbl(t0, x3);
-    // t0 = x3 + t0  (= 3*t0)
-    fq_add(x3, t0, tmp);
-    fq_copy(tmp, t0);
-    // t2 = mul_by_3b(t2)  (= 3*b*t2 = 9*t2)
-    fq_mul_by_3b(t2, tmp);
-    fq_copy(tmp, t2);
-    // z3 = t1 + t2
-    fq_add(t1, t2, z3);
-    // t1 = t1 - t2
-    fq_sub(t1, t2, tmp);
-    fq_copy(tmp, t1);
-    // y3 = mul_by_3b(y3)
-    fq_mul_by_3b(y3, tmp);
-    fq_copy(tmp, y3);
-    // x3 = t4 * y3
-    fq_mul(t4, y3, x3);
-    // t2 = t3 * t1
-    fq_mul(t3, t1, t2);
-    // x3 = t2 - x3
-    fq_sub(t2, x3, tmp);
-    fq_copy(tmp, x3);
-    // y3 = y3 * t0
-    fq_mul(y3, t0, tmp);
-    fq_copy(tmp, y3);
-    // t1 = t1 * z3
-    fq_mul(t1, z3, tmp);
-    fq_copy(tmp, t1);
-    // y3 = t1 + y3
-    fq_add(t1, y3, tmp);
-    fq_copy(tmp, y3);
-    // t0 = t0 * t3
-    fq_mul(t0, t3, tmp);
-    fq_copy(tmp, t0);
-    // z3 = z3 * t4
-    fq_mul(z3, t4, tmp);
-    fq_copy(tmp, z3);
-    // z3 = z3 + t0
-    fq_add(z3, t0, tmp);
-    fq_copy(tmp, z3);
+    fq_mul(x1, x2, t0);         // t0 = X1*X2
+    fq_mul(y1, y2, t1);         // t1 = Y1*Y2
+    fq_mul(z1, z2, t2);         // t2 = Z1*Z2
+    fq_add(x1, y1, t3);         // t3 = X1+Y1
+    fq_add(x2, y2, t4);         // t4 = X2+Y2
+    fq_mul(t3, t4, t3);         // t3 = (X1+Y1)*(X2+Y2)
+    fq_add(t0, t1, t4);         // t4 = t0+t1
+    fq_sub(t3, t4, t3);         // t3 = t3-t4 = X1*Y2+X2*Y1
+    fq_add(y1, z1, t4);         // t4 = Y1+Z1
+    fq_add(y2, z2, x3);         // x3 = Y2+Z2 (temporary)
+    fq_mul(t4, x3, t4);         // t4 = (Y1+Z1)*(Y2+Z2)
+    fq_add(t1, t2, x3);         // x3 = t1+t2
+    fq_sub(t4, x3, t4);         // t4 = Y1*Z2+Y2*Z1
+    fq_add(x1, z1, x3);         // x3 = X1+Z1
+    fq_add(x2, z2, y3);         // y3 = X2+Z2
+    fq_mul(x3, y3, x3);         // x3 = (X1+Z1)*(X2+Z2)
+    fq_add(t0, t2, y3);         // y3 = t0+t2
+    fq_sub(x3, y3, y3);         // y3 = X1*Z2+X2*Z1
+    fq_dbl(t0, x3);             // x3 = 2*t0
+    fq_add(x3, t0, t0);         // t0 = 3*t0
+    fq_mul_by_3b(t2, t2);       // t2 = 3b*t2 = 9*t2
+    fq_add(t1, t2, z3);         // z3 = t1+t2
+    fq_sub(t1, t2, t1);         // t1 = t1-t2
+    fq_mul_by_3b(y3, y3);       // y3 = 3b*y3 = 9*y3
+    fq_mul(t4, y3, x3);         // x3 = t4*y3
+    fq_mul(t3, t1, t2);         // t2 = t3*t1
+    fq_sub(t2, x3, x3);         // x3 = t2-x3
+    fq_mul(y3, t0, y3);         // y3 = y3*t0
+    fq_mul(t1, z3, t1);         // t1 = t1*z3
+    fq_add(t1, y3, y3);         // y3 = t1+y3
+    fq_mul(t0, t3, t0);         // t0 = t0*t3
+    fq_mul(z3, t4, z3);         // z3 = z3*t4
+    fq_add(z3, t0, z3);         // z3 = z3+t0
 }
 
 // ---- Point doubling: R = 2*P (projective, a=0) ----
 // Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
+// OPTIMIZED: alias-safe operations eliminate fq_copy.
 inline void projective_dbl(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread uint* x3, thread uint* y3, thread uint* z3
 ) {
     uint t0[8], t1[8], t2[8];
-    uint tmp[8];
 
-    // t0 = Y1^2
-    fq_sqr(y1, t0);
-    // z3 = t0 + t0
-    fq_dbl(t0, z3);
-    // z3 = z3 + z3
-    fq_dbl(z3, tmp);
-    fq_copy(tmp, z3);
-    // z3 = z3 + z3  (= 8*Y1^2)
-    fq_dbl(z3, tmp);
-    fq_copy(tmp, z3);
-    // t1 = Y1 * Z1
-    fq_mul(y1, z1, t1);
-    // t2 = Z1^2
-    fq_sqr(z1, t2);
-    // t2 = mul_by_3b(t2)  (= 9*Z1^2)
-    fq_mul_by_3b(t2, tmp);
-    fq_copy(tmp, t2);
-    // x3 = t2 * z3  (= 9*Z1^2 * 8*Y1^2)
-    fq_mul(t2, z3, x3);
-    // y3 = t0 + t2  (= Y1^2 + 9*Z1^2)
-    fq_add(t0, t2, y3);
-    // z3 = t1 * z3  (= Y1*Z1 * 8*Y1^2)
-    fq_mul(t1, z3, tmp);
-    fq_copy(tmp, z3);
-    // t1 = t2 + t2  (= 2*9*Z1^2)
-    fq_dbl(t2, t1);
-    // t2 = t1 + t2  (= 3*9*Z1^2 = 27*Z1^2)
-    fq_add(t1, t2, tmp);
-    fq_copy(tmp, t2);
-    // t0 = t0 - t2  (= Y1^2 - 27*Z1^2)
-    fq_sub(t0, t2, tmp);
-    fq_copy(tmp, t0);
-    // y3 = t0 * y3  (= (Y1^2-27Z1^2)*(Y1^2+9Z1^2))
-    fq_mul(t0, y3, tmp);
-    fq_copy(tmp, y3);
-    // y3 = x3 + y3
-    fq_add(x3, y3, tmp);
-    fq_copy(tmp, y3);
-    // t1 = X1 * Y1
-    fq_mul(x1, y1, t1);
-    // x3 = t0 * t1  (= (Y1^2-27Z1^2)*X1*Y1)
-    fq_mul(t0, t1, x3);
-    // x3 = x3 + x3  (= 2*(Y1^2-27Z1^2)*X1*Y1)
-    fq_dbl(x3, tmp);
-    fq_copy(tmp, x3);
+    fq_sqr(y1, t0);              // t0 = Y1^2
+    fq_dbl(t0, z3);              // z3 = 2*t0
+    fq_dbl(z3, z3);              // z3 = 4*t0
+    fq_dbl(z3, z3);              // z3 = 8*t0
+    fq_mul(y1, z1, t1);          // t1 = Y1*Z1
+    fq_sqr(z1, t2);              // t2 = Z1^2
+    fq_mul_by_3b(t2, t2);        // t2 = 9*Z1^2
+    fq_mul(t2, z3, x3);          // x3 = 9*Z1^2 * 8*Y1^2
+    fq_add(t0, t2, y3);          // y3 = Y1^2 + 9*Z1^2
+    fq_mul(t1, z3, z3);          // z3 = Y1*Z1 * 8*Y1^2
+    fq_dbl(t2, t1);              // t1 = 2*9*Z1^2
+    fq_add(t1, t2, t2);          // t2 = 3*9*Z1^2 = 27*Z1^2
+    fq_sub(t0, t2, t0);          // t0 = Y1^2 - 27*Z1^2
+    fq_mul(t0, y3, y3);          // y3 = (Y1^2-27Z1^2)*(Y1^2+9Z1^2)
+    fq_add(x3, y3, y3);          // y3 = x3 + y3
+    fq_mul(x1, y1, t1);          // t1 = X1*Y1
+    fq_mul(t0, t1, x3);          // x3 = (Y1^2-27Z1^2)*X1*Y1
+    fq_dbl(x3, x3);              // x3 = 2*(Y1^2-27Z1^2)*X1*Y1
 }
 
 // ---- Double-and-add: R = scalar * P (for small scalars, used in PBPR) ----
@@ -433,7 +339,7 @@ inline void double_and_add(
 
     if (scalar == 0) return;
 
-    uint tx[8], ty[8], tz[8];  // temp = current power of P
+    uint tx[8], ty[8], tz[8];
     fq_copy(px, tx);
     fq_copy(py, ty);
     fq_copy(pz, tz);
@@ -461,11 +367,10 @@ inline void double_and_add(
 // ============================================================================
 
 // ---- Test kernel: field operations ----
-// For each thread i: compute c[i] = a[i] * b[i] (Montgomery mul)
 kernel void test_field_ops(
-    device const uint* a [[buffer(0)]],    // n × 8 u32s
-    device const uint* b [[buffer(1)]],    // n × 8 u32s
-    device uint* c       [[buffer(2)]],    // n × 8 u32s (output)
+    device const uint* a [[buffer(0)]],
+    device const uint* b [[buffer(1)]],
+    device uint* c       [[buffer(2)]],
     uint id [[thread_position_in_grid]]
 ) {
     uint off = id * 8;
@@ -477,12 +382,11 @@ kernel void test_field_ops(
 }
 
 // ---- Test kernel: field add/sub/neg ----
-// op: 0=add, 1=sub, 2=neg(a)
 kernel void test_field_addsub(
-    device const uint* a   [[buffer(0)]],   // n × 8 u32s
-    device const uint* b   [[buffer(1)]],   // n × 8 u32s
-    device uint* c         [[buffer(2)]],   // n × 8 u32s (output)
-    device const uint* op  [[buffer(3)]],   // n × 1 u32
+    device const uint* a   [[buffer(0)]],
+    device const uint* b   [[buffer(1)]],
+    device uint* c         [[buffer(2)]],
+    device const uint* op  [[buffer(3)]],
     uint id [[thread_position_in_grid]]
 ) {
     uint off = id * 8;
@@ -501,14 +405,11 @@ kernel void test_field_addsub(
 }
 
 // ---- Test kernel: Jacobian mixed-addition ----
-// For each thread i: out[i] = jac[i] + aff[i]
-// jac: n × 24 u32s (X,Y,Z), aff: n × 16 u32s (x,y), sign: n × u32
-// out: n × 24 u32s (X,Y,Z)
 kernel void test_jacobian_madd(
-    device const uint* jac  [[buffer(0)]],   // n × 24 u32s
-    device const uint* aff  [[buffer(1)]],   // n × 16 u32s
-    device const uint* sign [[buffer(2)]],   // n × 1 u32 (1=add, 0=subtract)
-    device uint* out        [[buffer(3)]],   // n × 24 u32s
+    device const uint* jac  [[buffer(0)]],
+    device const uint* aff  [[buffer(1)]],
+    device const uint* sign [[buffer(2)]],
+    device uint* out        [[buffer(3)]],
     uint id [[thread_position_in_grid]]
 ) {
     uint joff = id * 24;
@@ -521,7 +422,6 @@ kernel void test_jacobian_madd(
     fq_load(aff + aoff, ax);
     fq_load(aff + aoff + 8, ay);
 
-    // Apply sign: if sign==0, negate y-coordinate of affine point
     if (sign[id] == 0) {
         fq_neg(ay, ay);
     }
@@ -535,23 +435,14 @@ kernel void test_jacobian_madd(
 }
 
 // ---- Main kernel: bucket accumulation (all windows in one dispatch) ----
-// 2D grid: thread.x = bucket index, thread.y = window index.
-// Each thread owns one bucket in one window.
-//
-// Scatter entries are packed: each entry is a single u32 with
-//   base_idx = packed & 0x7FFFFFFFu  (low 31 bits)
-//   sign     = packed >> 31           (MSB: 1 = positive, 0 = negate y)
-//
-// window_params layout: per-window [scatter_start, offsets_start, buckets_start] × 3 u32s
-//   scatter_start: index into scatter_entries where this window's data begins
-//   offsets_start: index into bucket_offsets where this window's offsets begin
-//   buckets_start: index into buckets_out where this window's buckets begin (in 24-u32 units)
+// OPTIMIZED: First scatter entry initializes accumulator directly (skip identity madd).
+//            Subsequent entries use projective_madd with alias-safe in-place updates.
 kernel void bucket_accumulate_all(
-    device const uint* bases           [[buffer(0)]],  // n × 16 u32s (affine x,y)
-    device const uint* scatter_entries [[buffer(1)]],  // ALL windows concatenated, packed u32s
-    device const uint* bucket_offsets  [[buffer(2)]],  // ALL windows concatenated, (num_buckets+1) × num_windows u32s
-    device uint* buckets_out           [[buffer(3)]],  // ALL windows, num_windows × num_buckets × 24 u32s
-    device const uint* window_params   [[buffer(4)]],  // num_windows × 3 u32s [scatter_start, offsets_start, buckets_start]
+    device const uint* bases           [[buffer(0)]],
+    device const uint* scatter_entries [[buffer(1)]],
+    device const uint* bucket_offsets  [[buffer(2)]],
+    device uint* buckets_out           [[buffer(3)]],
+    device const uint* window_params   [[buffer(4)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     uint bucket_idx = tid.x;
@@ -568,25 +459,31 @@ kernel void bucket_accumulate_all(
 
     if (start == end) {
         // Empty bucket → identity (0, 1_mont, 0)
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + i] = 0;
-        }
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + 8 + i] = FQ_ONE[i];
-        }
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + 16 + i] = 0;
-        }
+        for (int i = 0; i < 8; i++) buckets_out[boff + i] = 0;
+        for (int i = 0; i < 8; i++) buckets_out[boff + 8 + i] = FQ_ONE[i];
+        for (int i = 0; i < 8; i++) buckets_out[boff + 16 + i] = 0;
         return;
     }
 
-    // Initialize accumulator to identity
-    uint accx[8] = {0,0,0,0,0,0,0,0};
-    uint accy[8] = {FQ_ONE[0],FQ_ONE[1],FQ_ONE[2],FQ_ONE[3],
-                     FQ_ONE[4],FQ_ONE[5],FQ_ONE[6],FQ_ONE[7]};
-    uint accz[8] = {0,0,0,0,0,0,0,0};
+    // Load first point directly as accumulator (avoid identity + first madd)
+    uint e0 = scatter_start + start;
+    uint packed0 = scatter_entries[e0];
+    uint base_idx0 = packed0 & 0x7FFFFFFFu;
+    uint s0 = packed0 >> 31;
+    uint poff0 = base_idx0 * 16;
 
-    for (uint e = scatter_start + start; e < scatter_start + end; e++) {
+    // For first point: acc = (x, ±y, 1_mont) in projective (= affine point as projective)
+    uint accx[8], accy[8], accz[8];
+    fq_load(bases + poff0, accx);
+    fq_load(bases + poff0 + 8, accy);
+    if (s0 == 0) {
+        fq_neg(accy, accy);
+    }
+    for (int i = 0; i < 8; i++) accz[i] = FQ_ONE[i];
+
+    // Process remaining entries — projective_madd is alias-safe for output aliasing input,
+    // so we write directly to accx/accy/accz (eliminates 3 fq_copy per iteration).
+    for (uint e = e0 + 1; e < scatter_start + end; e++) {
         uint packed   = scatter_entries[e];
         uint base_idx = packed & 0x7FFFFFFFu;
         uint s        = packed >> 31;
@@ -600,11 +497,7 @@ kernel void bucket_accumulate_all(
             fq_neg(ay, ay);
         }
 
-        uint rx[8], ry[8], rz[8];
-        projective_madd(accx, accy, accz, ax, ay, rx, ry, rz);
-        fq_copy(rx, accx);
-        fq_copy(ry, accy);
-        fq_copy(rz, accz);
+        projective_madd(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
     fq_store(accx, buckets_out + boff);
@@ -614,98 +507,64 @@ kernel void bucket_accumulate_all(
 
 // ---- Original single-window bucket accumulation (kept for tests) ----
 kernel void bucket_accumulate(
-    device const uint* bases           [[buffer(0)]],  // n × 16 u32s (affine x,y)
-    device const uint* scatter_entries [[buffer(1)]],  // total packed u32s (base_idx|sign<<31)
-    device const uint* bucket_offsets  [[buffer(2)]],  // (num_buckets+1) u32s
-    device uint* buckets_out           [[buffer(3)]],  // num_buckets × 24 u32s (Jac x,y,z)
+    device const uint* bases           [[buffer(0)]],
+    device const uint* scatter_entries [[buffer(1)]],
+    device const uint* bucket_offsets  [[buffer(2)]],
+    device uint* buckets_out           [[buffer(3)]],
     uint tid [[thread_position_in_grid]]
 ) {
     uint start = bucket_offsets[tid];
     uint end   = bucket_offsets[tid + 1];
 
+    uint boff_out = tid * 24;
+
     if (start == end) {
-        // Empty bucket → identity (0, 1_mont, 0)
-        uint boff = tid * 24;
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + i] = 0;           // x = 0
-        }
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + 8 + i] = FQ_ONE[i]; // y = 1_mont
-        }
-        for (int i = 0; i < 8; i++) {
-            buckets_out[boff + 16 + i] = 0;      // z = 0
-        }
+        for (int i = 0; i < 8; i++) buckets_out[boff_out + i] = 0;
+        for (int i = 0; i < 8; i++) buckets_out[boff_out + 8 + i] = FQ_ONE[i];
+        for (int i = 0; i < 8; i++) buckets_out[boff_out + 16 + i] = 0;
         return;
     }
 
-    // Initialize accumulator to identity: (0, 1_mont, 0)
-    // halo2curves identity = (x=0, y=Fq::ONE, z=0)
-    uint accx[8] = {0,0,0,0,0,0,0,0};
-    uint accy[8] = {FQ_ONE[0],FQ_ONE[1],FQ_ONE[2],FQ_ONE[3],
-                     FQ_ONE[4],FQ_ONE[5],FQ_ONE[6],FQ_ONE[7]};
-    uint accz[8] = {0,0,0,0,0,0,0,0};
+    // Load first point directly
+    uint packed0 = scatter_entries[start];
+    uint base_idx0 = packed0 & 0x7FFFFFFFu;
+    uint s0 = packed0 >> 31;
+    uint poff0 = base_idx0 * 16;
 
-    for (uint e = start; e < end; e++) {
+    uint accx[8], accy[8], accz[8];
+    fq_load(bases + poff0, accx);
+    fq_load(bases + poff0 + 8, accy);
+    if (s0 == 0) { fq_neg(accy, accy); }
+    for (int i = 0; i < 8; i++) accz[i] = FQ_ONE[i];
+
+    for (uint e = start + 1; e < end; e++) {
         uint packed   = scatter_entries[e];
         uint base_idx = packed & 0x7FFFFFFFu;
         uint s        = packed >> 31;
 
-        // Load affine point
         uint poff = base_idx * 16;
         uint ax[8], ay[8];
         fq_load(bases + poff, ax);
         fq_load(bases + poff + 8, ay);
 
-        // Apply sign
-        if (s == 0) {
-            fq_neg(ay, ay);
-        }
+        if (s == 0) { fq_neg(ay, ay); }
 
-        // Mixed-add into accumulator
-        uint rx[8], ry[8], rz[8];
-        projective_madd(accx, accy, accz, ax, ay, rx, ry, rz);
-        fq_copy(rx, accx);
-        fq_copy(ry, accy);
-        fq_copy(rz, accz);
+        projective_madd(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
-    // Write result
-    uint boff = tid * 24;
-    fq_store(accx, buckets_out + boff);
-    fq_store(accy, buckets_out + boff + 8);
-    fq_store(accz, buckets_out + boff + 16);
+    fq_store(accx, buckets_out + boff_out);
+    fq_store(accy, buckets_out + boff_out + 8);
+    fq_store(accz, buckets_out + boff_out + 16);
 }
 
 // ============================================================================
 // PBPR: Parallel Bucket Point Reduction (two-stage)
-// Adapted from cuZK paper (ePrint 2022/1321) and zkmopro/gpu-acceleration.
-//
-// Standard summation-by-parts for buckets B[0..N-1] where B[b] has weight (b+1):
-//   result = Σ_{b=0}^{N-1} (b+1)·B[b]
-//          = B[N-1] + (B[N-1]+B[N-2]) + ... + (B[N-1]+...+B[0])
-// This is computed by iterating high→low: running_sum += B[i], total += running_sum.
-//
-// PBPR splits buckets into T segments processed in parallel:
-//   Thread t handles segment [seg_start .. seg_start - bpt + 1] (high→low)
-//   where seg_start = (N-1) - t*bpt.
-//
-//   Stage 1: Each thread computes local line_sum (m) and triangle_sum (g).
-//   Stage 2: Correct g by adding m * position_offset via double-and-add,
-//            where offset = (T-t-1)*bpt accounts for lower segments.
-//
-// After both stages, the T partial g-points are summed on CPU (tiny: ~256 points).
 // ============================================================================
 
-// ---- PBPR Stage 1: Partial bucket reduction ----
-// Thread t processes bpt buckets starting from seg_start = (N-1)-t*bpt going DOWN.
-// Computes: m = sum of all buckets in segment (line sum)
-//           g = triangle sum = Σ_{i=0}^{bpt-1} partial_sum_i
-//
-// params: [num_buckets, num_threads]
 kernel void bucket_reduce_stage1(
-    device uint* buckets       [[buffer(0)]],   // num_buckets × 24 u32s (read/write)
-    device uint* g_points      [[buffer(1)]],   // num_threads × 24 u32s (output)
-    device const uint* params  [[buffer(2)]],   // [num_buckets, num_threads]
+    device uint* buckets       [[buffer(0)]],
+    device uint* g_points      [[buffer(1)]],
+    device const uint* params  [[buffer(2)]],
     uint tid [[thread_position_in_grid]]
 ) {
     uint num_buckets = params[0];
@@ -714,11 +573,8 @@ kernel void bucket_reduce_stage1(
 
     if (tid >= num_threads) return;
 
-    // Thread t processes the segment starting at (N-1 - t*bpt) going down.
-    // Thread 0 → highest buckets, Thread T-1 → lowest buckets.
     uint seg_start = num_buckets - 1 - tid * bpt;
 
-    // Load highest bucket in segment as initial m and g
     uint mx[8], my[8], mz[8];
     uint gx[8], gy[8], gz[8];
     {
@@ -731,7 +587,6 @@ kernel void bucket_reduce_stage1(
     fq_copy(my, gy);
     fq_copy(mz, gz);
 
-    // Iterate over remaining buckets in the segment (descending bucket index)
     for (uint i = 1; i < bpt; i++) {
         uint bi = seg_start - i;
         uint boff = bi * 24;
@@ -740,29 +595,26 @@ kernel void bucket_reduce_stage1(
         fq_load(buckets + boff + 8,  by);
         fq_load(buckets + boff + 16, bz);
 
-        // m += bucket[bi]  (running line sum)
+        // m += bucket[bi]
         uint ox[8], oy[8], oz[8];
         projective_add(mx, my, mz, bx, by, bz, ox, oy, oz);
         fq_copy(ox, mx);
         fq_copy(oy, my);
         fq_copy(oz, mz);
 
-        // g += m  (triangle sum accumulation)
+        // g += m
         projective_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
         fq_copy(ox, gx);
         fq_copy(oy, gy);
         fq_copy(oz, gz);
     }
 
-    // Store m at seg_start position for stage 2 to read
     {
         uint boff = seg_start * 24;
         fq_store(mx, buckets + boff);
         fq_store(my, buckets + boff + 8);
         fq_store(mz, buckets + boff + 16);
     }
-
-    // Store g to output g_points
     {
         uint goff = tid * 24;
         fq_store(gx, g_points + goff);
@@ -771,17 +623,10 @@ kernel void bucket_reduce_stage1(
     }
 }
 
-// ---- PBPR Stage 2: Position correction ----
-// Thread t's local triangle sum assumed weights bpt, bpt-1, ..., 1.
-// But the true weights are (seg_start+1), seg_start, ..., (seg_start-bpt+2).
-// Difference = (seg_start+1) - bpt = N - (t+1)*bpt = (T-t-1)*bpt (constant per segment).
-// So: g_corrected = g + (T-t-1)*bpt * m
-//
-// params: [num_buckets, num_threads]
 kernel void bucket_reduce_stage2(
-    device const uint* buckets [[buffer(0)]],   // num_buckets × 24 u32s (read only: m from stage 1)
-    device uint* g_points      [[buffer(1)]],   // num_threads × 24 u32s (read/write)
-    device const uint* params  [[buffer(2)]],   // [num_buckets, num_threads]
+    device const uint* buckets [[buffer(0)]],
+    device uint* g_points      [[buffer(1)]],
+    device const uint* params  [[buffer(2)]],
     uint tid [[thread_position_in_grid]]
 ) {
     uint num_buckets = params[0];
@@ -790,7 +635,6 @@ kernel void bucket_reduce_stage2(
 
     if (tid >= num_threads) return;
 
-    // Load m from the segment's start bucket (written by stage 1)
     uint seg_start = num_buckets - 1 - tid * bpt;
     uint mx[8], my[8], mz[8];
     {
@@ -800,7 +644,6 @@ kernel void bucket_reduce_stage2(
         fq_load(buckets + boff + 16, mz);
     }
 
-    // Load g from g_points
     uint gx[8], gy[8], gz[8];
     {
         uint goff = tid * 24;
@@ -809,12 +652,8 @@ kernel void bucket_reduce_stage2(
         fq_load(g_points + goff + 16, gz);
     }
 
-    // Correction scalar = (T - t - 1) * bpt
-    // Thread 0 (highest segment) gets the largest correction
-    // Thread T-1 (lowest segment) gets correction 0
     uint scalar = bpt * (num_threads - tid - 1);
     if (scalar > 0) {
-        // g += double_and_add(m, scalar)
         uint dax[8], day[8], daz[8];
         double_and_add(mx, my, mz, scalar, dax, day, daz);
 
@@ -825,7 +664,6 @@ kernel void bucket_reduce_stage2(
         fq_copy(oz, gz);
     }
 
-    // Write corrected g back
     {
         uint goff = tid * 24;
         fq_store(gx, g_points + goff);
@@ -837,13 +675,12 @@ kernel void bucket_reduce_stage2(
 // ============================================================================
 // Multi-window PBPR: All windows reduced in one dispatch
 // 2D grid: (num_reduce_threads, num_windows)
-// params: [num_buckets_per_window, num_reduce_threads]
 // ============================================================================
 
 kernel void bucket_reduce_stage1_all(
-    device uint* buckets       [[buffer(0)]],   // ALL windows: num_windows × num_buckets × 24 u32s
-    device uint* g_points      [[buffer(1)]],   // ALL windows: num_windows × num_threads × 24 u32s
-    device const uint* params  [[buffer(2)]],   // [num_buckets_per_window, num_reduce_threads]
+    device uint* buckets       [[buffer(0)]],
+    device uint* g_points      [[buffer(1)]],
+    device const uint* params  [[buffer(2)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     uint thread_idx = tid.x;
@@ -855,11 +692,9 @@ kernel void bucket_reduce_stage1_all(
 
     if (thread_idx >= num_threads) return;
 
-    // Offset into this window's buckets
     uint window_bucket_offset = window_idx * num_buckets;
     uint seg_start = window_bucket_offset + num_buckets - 1 - thread_idx * bpt;
 
-    // Load highest bucket in segment
     uint mx[8], my[8], mz[8];
     uint gx[8], gy[8], gz[8];
     {
@@ -880,27 +715,26 @@ kernel void bucket_reduce_stage1_all(
         fq_load(buckets + boff + 8,  by);
         fq_load(buckets + boff + 16, bz);
 
+        // m += bucket[bi]
         uint ox[8], oy[8], oz[8];
         projective_add(mx, my, mz, bx, by, bz, ox, oy, oz);
         fq_copy(ox, mx);
         fq_copy(oy, my);
         fq_copy(oz, mz);
 
+        // g += m
         projective_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
         fq_copy(ox, gx);
         fq_copy(oy, gy);
         fq_copy(oz, gz);
     }
 
-    // Store m at seg_start for stage 2
     {
         uint boff = seg_start * 24;
         fq_store(mx, buckets + boff);
         fq_store(my, buckets + boff + 8);
         fq_store(mz, buckets + boff + 16);
     }
-
-    // Store g to output g_points (offset by window)
     {
         uint goff = (window_idx * num_threads + thread_idx) * 24;
         fq_store(gx, g_points + goff);
@@ -948,6 +782,7 @@ kernel void bucket_reduce_stage2_all(
         uint dax[8], day[8], daz[8];
         double_and_add(mx, my, mz, scalar, dax, day, daz);
 
+        // alias-safe: output = gx,gy,gz
         uint ox[8], oy[8], oz[8];
         projective_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
         fq_copy(ox, gx);
