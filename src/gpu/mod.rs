@@ -302,10 +302,72 @@ impl std::fmt::Display for GpuMsmTiming {
     }
 }
 
-/// GPU-accelerated multi-scalar multiplication for BN254 G1.
+/// GPU-accelerated multi-scalar multiplication.
 ///
-/// Falls back to CPU `msm_best` for small inputs (< 2^14 points).
-pub fn msm_gpu(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
+/// Generic over any `CurveAffine + GpuMsm` type. When `C` is `bn256::G1Affine`,
+/// dispatches to the Metal GPU implementation **at compile time** via the `GpuMsm`
+/// trait. For all other curve types, falls back to the CPU-only `msm_best`.
+///
+/// This allows `msm_gpu` to be used as a drop-in replacement for `msm_best`:
+/// ```ignore
+/// // Works for BN254 G1 (uses GPU):
+/// let result = msm_gpu(&bn254_scalars, &bn254_points);
+/// // Works for any other curve (falls back to CPU):
+/// let result = msm_gpu(&other_scalars, &other_points);
+/// ```
+pub fn msm_gpu<C: GpuMsm>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    C::msm_gpu_dispatch(coeffs, bases)
+}
+
+/// Trait for compile-time GPU MSM dispatch.
+///
+/// `bn256::G1Affine` uses the Metal GPU backend; all other curve types fall
+/// back to `msm_best`. This is resolved at compile time — no runtime overhead.
+pub trait GpuMsm: CurveAffine {
+    #[doc(hidden)]
+    fn msm_gpu_dispatch(coeffs: &[Self::Scalar], bases: &[Self]) -> Self::Curve;
+}
+
+// ── GPU-accelerated: BN254 G1 ──────────────────────────────────────────────
+
+impl GpuMsm for G1Affine {
+    fn msm_gpu_dispatch(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
+        msm_gpu_bn254(coeffs, bases)
+    }
+}
+
+// ── CPU fallback for all other curves ──────────────────────────────────────
+//
+// Macro to reduce boilerplate: generates `impl GpuMsm` with `msm_best` fallback.
+macro_rules! impl_gpu_msm_fallback {
+    ($affine:ty) => {
+        impl GpuMsm for $affine {
+            fn msm_gpu_dispatch(
+                coeffs: &[Self::Scalar],
+                bases: &[Self],
+            ) -> Self::Curve {
+                crate::msm::msm_best(coeffs, bases)
+            }
+        }
+    };
+}
+
+impl_gpu_msm_fallback!(crate::bn256::G2Affine);
+impl_gpu_msm_fallback!(crate::grumpkin::G1Affine);
+impl_gpu_msm_fallback!(crate::pasta::PallasAffine);
+impl_gpu_msm_fallback!(crate::pasta::VestaAffine);
+impl_gpu_msm_fallback!(crate::secp256k1::Secp256k1Affine);
+impl_gpu_msm_fallback!(crate::secp256r1::Secp256r1Affine);
+impl_gpu_msm_fallback!(crate::secq256k1::Secq256k1Affine);
+impl_gpu_msm_fallback!(crate::bls12381::G1Affine);
+impl_gpu_msm_fallback!(crate::bls12381::G2Affine);
+impl_gpu_msm_fallback!(crate::pluto_eris::G1Affine);
+impl_gpu_msm_fallback!(crate::pluto_eris::ErisAffine);
+impl_gpu_msm_fallback!(crate::pluto_eris::G2Affine);
+impl_gpu_msm_fallback!(crate::t256::T256Affine);
+
+/// GPU-accelerated MSM for BN254 G1 (concrete implementation).
+fn msm_gpu_bn254(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     msm_gpu_inner(coeffs, bases, false).0
 }
 
