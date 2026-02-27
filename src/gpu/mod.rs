@@ -449,6 +449,101 @@ pub fn msm_gpu_timed(coeffs: &[Fr], bases: &[G1Affine]) -> (G1, GpuMsmTiming) {
     msm_gpu_inner(coeffs, bases, true)
 }
 
+/// Pre-warm all GPU MSM resources for a given problem size.
+///
+/// Call once at application startup (e.g., before proving rounds) to eliminate
+/// cold-start overhead from the first `msm_gpu` call. This pre-allocates:
+///
+/// 1. **GPU context** — Metal shader compilation + 14 compute pipelines (~50-100ms)
+/// 2. **Metal buffer pool** — 7 GPU buffers sized for `n` points (avoids page faults)
+/// 3. **Booth index cache** — CPU-side `n * windows * 2` byte array (avoids 512MB alloc at k=24)
+/// 4. **GPU wake** — Dummy dispatch to wake GPU from idle power-down (~10ms on Apple Silicon)
+///
+/// # Example
+/// ```ignore
+/// // Before proving:
+/// msm_gpu_warmup(1 << 22); // pre-warm for k=22 (4M points)
+/// // Now first msm_gpu call is as fast as subsequent calls.
+/// ```
+pub fn msm_gpu_warmup(n: usize) {
+    use ff::PrimeField;
+
+    if n < (1 << 14) { return; } // too small for GPU
+
+    let c = get_optimal_c_gpu(n);
+    let num_buckets = 1usize << (c - 1);
+    let num_bits = Fr::NUM_BITS as usize;
+    let number_of_windows = num_bits / c + 1;
+
+    // 1. Initialize GpuContext (compiles shader, creates pipelines)
+    let ctx = gpu_ctx();
+
+    // 2. Pre-allocate Metal buffers at target sizes and return them to the pool.
+    //    This forces the OS to back the virtual pages with physical memory now,
+    //    avoiding page faults during the first real MSM call.
+    let bases_bytes = (n * 64) as u64; // G1Affine = 64 bytes
+    let max_scatter_per_window = n; // worst case: all scalars non-zero
+    let scatter_bytes = (number_of_windows * max_scatter_per_window * 4) as u64;
+    let offsets_bytes = (number_of_windows * (num_buckets + 1) * 4) as u64;
+    let buckets_bytes = (number_of_windows * num_buckets * 24 * 4) as u64; // 24 u32 per Jacobian
+    let window_params_bytes = (number_of_windows * 3 * 4) as u64;
+    let g_points_bytes = (number_of_windows * 24 * 4) as u64; // PBPR g_points
+    let reduce_params_bytes = 8u64;
+
+    let bufs = vec![
+        ctx.acquire_buffer(bases_bytes),
+        ctx.acquire_buffer(scatter_bytes),
+        ctx.acquire_buffer(offsets_bytes),
+        ctx.acquire_buffer(buckets_bytes),
+        ctx.acquire_buffer(window_params_bytes),
+        ctx.acquire_buffer(g_points_bytes),
+        ctx.acquire_buffer(reduce_params_bytes),
+    ];
+
+    // Touch every page to force physical backing (avoid lazy allocation page faults)
+    for buf in &bufs {
+        let ptr = buf.contents() as *mut u8;
+        let len = buf.length() as usize;
+        // Write one byte per 4KB page
+        for offset in (0..len).step_by(4096) {
+            unsafe { ptr.add(offset).write_volatile(0); }
+        }
+    }
+
+    ctx.release_buffers(bufs);
+
+    // 3. Pre-allocate booth index cache
+    {
+        let booth_len = number_of_windows * n;
+        let mut booth = vec![0i16; booth_len];
+        // Touch all pages
+        for offset in (0..booth_len).step_by(2048) { // 2048 i16 = 4KB
+            booth[offset] = 0;
+        }
+        let mut cached = BOOTH_CACHE.lock().unwrap();
+        *cached = booth;
+    }
+
+    // 4. Wake GPU with a trivial dispatch (forces GPU out of idle power-down)
+    {
+        let dummy = ctx.acquire_buffer(64);
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
+        enc.set_buffer(0, Some(&dummy), 0);
+        enc.set_buffer(1, Some(&dummy), 0);
+        enc.set_buffer(2, Some(&dummy), 0);
+        enc.set_buffer(3, Some(&dummy), 0);
+        enc.set_buffer(4, Some(&dummy), 0);
+        let size = metal::MTLSize::new(1, 1, 1);
+        enc.dispatch_threads(size, size);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        ctx.release_buffers(vec![dummy]);
+    }
+}
+
 fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmTiming) {
     use rayon::prelude::*;
     use std::time::Instant;
