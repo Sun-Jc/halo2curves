@@ -89,6 +89,11 @@ pub(crate) struct GpuContext {
 
 static GPU_CTX: OnceLock<GpuContext> = OnceLock::new();
 
+/// Cached CPU-side booth index buffer to avoid repeated large allocations.
+/// On k=24 this is 512MB — re-allocating each MSM call causes significant
+/// page-fault overhead on first touch. By caching, we pay this cost only once.
+static BOOTH_CACHE: Mutex<Vec<i16>> = Mutex::new(Vec::new());
+
 pub(crate) fn gpu_ctx() -> &'static GpuContext {
     GPU_CTX.get_or_init(|| {
         // Retry GPU device acquisition — paravirtual devices may be transiently unavailable
@@ -517,21 +522,31 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     // This eliminates the 512MB intermediate coeffs_bytes allocation.
     let t0 = Instant::now();
 
-    let booth = {
-        let mut booth = vec![0i16; number_of_windows * n];
-        let booth_addr = booth.as_mut_ptr() as usize;
-
-        coeffs.par_iter().enumerate().for_each(|(i, s)| {
-            let bytes = s.to_repr();
-            let ptr = booth_addr as *mut i16;
-            for w in 0..number_of_windows {
-                let idx = get_booth_index(w, c, bytes.as_ref());
-                // SAFETY: each scalar i writes to distinct positions [w*n + i].
-                unsafe { *ptr.add(w * n + i) = idx as i16; }
-            }
-        });
-        booth
+    let booth_len = number_of_windows * n;
+    let mut booth = {
+        let mut cached = BOOTH_CACHE.lock().unwrap();
+        if cached.capacity() >= booth_len {
+            let mut b = std::mem::take(&mut *cached);
+            // Resize without zeroing — encode will overwrite every position
+            unsafe { b.set_len(booth_len); }
+            b
+        } else {
+            drop(cached);
+            // First call or size grew: allocate fresh (this pays the page-fault cost once)
+            vec![0i16; booth_len]
+        }
     };
+    let booth_addr = booth.as_mut_ptr() as usize;
+
+    coeffs.par_iter().enumerate().for_each(|(i, s)| {
+        let bytes = s.to_repr();
+        let ptr = booth_addr as *mut i16;
+        for w in 0..number_of_windows {
+            let idx = get_booth_index(w, c, bytes.as_ref());
+            // SAFETY: each scalar i writes to distinct positions [w*n + i].
+            unsafe { *ptr.add(w * n + i) = idx as i16; }
+        }
+    });
     if timed { timing.scalar_encode_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     let t0 = Instant::now();
@@ -572,6 +587,12 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         })
         .collect();
     if timed { timing.scatter_build_ms = t0.elapsed().as_secs_f64() * 1000.0; }
+
+    // Return booth buffer to cache for reuse in next MSM call
+    {
+        let mut cached = BOOTH_CACHE.lock().unwrap();
+        *cached = booth;
+    }
 
     // Wait for base packing to finish (should already be done since scatter is slower)
     let t0 = Instant::now();
