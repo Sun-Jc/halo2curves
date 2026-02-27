@@ -870,7 +870,12 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let num_buckets = 1usize << (c - 1);
     let number_of_windows = half_bits / c + 1;
 
-    // Run base packing and scatter building concurrently
+    // Run base packing and (fused encode + scatter build) concurrently.
+    //
+    // Fused approach: precompute ALL booth indices for both k1 and k2 in
+    // column-major layout [window][scalar], then build scatter tables with
+    // sequential reads. This eliminates the cache-pathological column-stride
+    // access pattern in build_scatter_table_glv.
     let (_, scatter_tables) = rayon::join(
         || {
             // Pack 2n affine bases into GPU buffer (parallelized)
@@ -900,14 +905,83 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             });
         },
         || {
-            // Build ALL scatter tables in parallel
+            // Precompute booth indices in column-major layout [W][n] for both k1 and k2.
+            // Each entry stores (booth_index, effective_sign, base_index) packed as:
+            //   booth1[w * n + i] = signed booth index for k1 scalar i at window w
+            //   booth2[w * n + i] = signed booth index for k2 scalar i at window w
+            let mut booth1 = vec![0i16; number_of_windows * n];
+            let mut booth2 = vec![0i16; number_of_windows * n];
+            let booth1_addr = booth1.as_mut_ptr() as usize;
+            let booth2_addr = booth2.as_mut_ptr() as usize;
+
+            // Parallel precompute: each scalar computes all its window indices
+            (0..n).into_par_iter().for_each(|i| {
+                let p1 = booth1_addr as *mut i16;
+                let p2 = booth2_addr as *mut i16;
+                for w in 0..number_of_windows {
+                    // SAFETY: each scalar i writes to distinct positions [w*n + i]
+                    unsafe {
+                        *p1.add(w * n + i) = get_booth_index(w, c, &k1_bytes[i]) as i16;
+                        *p2.add(w * n + i) = get_booth_index(w, c, &k2_bytes[i]) as i16;
+                    }
+                }
+            });
+
+            // Build scatter tables from precomputed booth indices (sequential reads)
             (0..number_of_windows)
                 .into_par_iter()
-                .map(|w| build_scatter_table_glv(
-                    w, c, num_buckets, n,
-                    &k1_bytes, &k1_signs,
-                    &k2_bytes, &k2_signs,
-                ))
+                .map(|w| {
+                    let b1_slice = &booth1[w * n..(w + 1) * n];
+                    let b2_slice = &booth2[w * n..(w + 1) * n];
+
+                    // Pass 1: count entries per bucket
+                    let mut counts = vec![0u32; num_buckets];
+                    for &idx in b1_slice {
+                        if idx != 0 {
+                            counts[idx.unsigned_abs() as usize - 1] += 1;
+                        }
+                    }
+                    for &idx in b2_slice {
+                        if idx != 0 {
+                            counts[idx.unsigned_abs() as usize - 1] += 1;
+                        }
+                    }
+
+                    // Prefix-sum
+                    let mut bucket_offsets = vec![0u32; num_buckets + 1];
+                    for b in 0..num_buckets {
+                        bucket_offsets[b + 1] = bucket_offsets[b] + counts[b];
+                    }
+                    let total = bucket_offsets[num_buckets] as usize;
+
+                    // Pass 2: fill scatter entries
+                    let mut scatter_entries = vec![0u32; total];
+                    let mut write_pos = bucket_offsets[..num_buckets].to_vec();
+
+                    for (i, &idx) in b1_slice.iter().enumerate() {
+                        if idx != 0 {
+                            let booth_positive = idx > 0;
+                            let effective_positive = booth_positive ^ (!k1_signs[i]);
+                            let buck = idx.unsigned_abs() as usize - 1;
+                            let pos = write_pos[buck] as usize;
+                            scatter_entries[pos] = (i as u32) | ((effective_positive as u32) << 31);
+                            write_pos[buck] += 1;
+                        }
+                    }
+
+                    for (i, &idx) in b2_slice.iter().enumerate() {
+                        if idx != 0 {
+                            let booth_positive = idx > 0;
+                            let effective_positive = booth_positive ^ (!k2_signs[i]);
+                            let buck = idx.unsigned_abs() as usize - 1;
+                            let pos = write_pos[buck] as usize;
+                            scatter_entries[pos] = ((n + i) as u32) | ((effective_positive as u32) << 31);
+                            write_pos[buck] += 1;
+                        }
+                    }
+
+                    (bucket_offsets, scatter_entries)
+                })
                 .collect::<Vec<_>>()
         },
     );
@@ -975,29 +1049,11 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
         scatter_cursor += entries.len() as u32;
     }
 
-    // 6. Dispatch bucket_accumulate_all kernel
-    if num_active > 0 {
-        let cb = ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
-        enc.set_buffer(0, Some(&bases_buf), 0);
-        enc.set_buffer(1, Some(&scatter_buf), 0);
-        enc.set_buffer(2, Some(&offsets_buf), 0);
-        enc.set_buffer(3, Some(&buckets_buf), 0);
-        enc.set_buffer(4, Some(&window_params_buf), 0);
-
-        let max_tg = ctx
-            .bucket_accumulate_all_pipeline
-            .max_total_threads_per_threadgroup() as u64;
-        let grid = MTLSize::new(num_buckets as u64, num_active as u64, 1);
-        let tg = MTLSize::new(max_tg.min(num_buckets as u64), 1, 1);
-        enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-    }
-
-    // 7. PBPR or CPU reduction
+    // 6+7. Dispatch accumulate + PBPR in ONE command buffer.
+    //
+    // Merging all GPU work into a single commit()+wait() eliminates CPU-GPU
+    // synchronization overhead between kernel and reduce phases (~5ms).
+    // Metal guarantees sequential execution of encoders within one command buffer.
     let use_pbpr = num_buckets >= 256;
     let num_reduce_threads = if use_pbpr {
         let max_tg = ctx.bucket_reduce_stage1_all_pipeline
@@ -1010,28 +1066,45 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
 
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
 
-    let mut extra_bufs: Vec<Buffer> = Vec::new();
+    let g_points_buf: Option<Buffer>;
+    let reduce_params_buf: Option<Buffer>;
 
-    if use_pbpr && num_active > 0 {
-        let g_points_buf = ctx.acquire_buffer(
-            (num_active * num_reduce_threads * 24 * 4) as u64,
-        );
-        let params_buf = ctx.acquire_buffer(8);
-        unsafe {
-            let p = params_buf.contents() as *mut u32;
-            *p = num_buckets as u32;
-            *p.add(1) = num_reduce_threads as u32;
-        }
+    if num_active > 0 {
+        let cb = ctx.queue.new_command_buffer();
 
-        // Stage 1 + Stage 2 in a single command buffer
-        {
-            let cb = ctx.queue.new_command_buffer();
+        // Bucket accumulation kernel
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
+        enc.set_buffer(0, Some(&bases_buf), 0);
+        enc.set_buffer(1, Some(&scatter_buf), 0);
+        enc.set_buffer(2, Some(&offsets_buf), 0);
+        enc.set_buffer(3, Some(&buckets_buf), 0);
+        enc.set_buffer(4, Some(&window_params_buf), 0);
+        let max_tg = ctx
+            .bucket_accumulate_all_pipeline
+            .max_total_threads_per_threadgroup() as u64;
+        let grid = MTLSize::new(num_buckets as u64, num_active as u64, 1);
+        let tg = MTLSize::new(max_tg.min(num_buckets as u64), 1, 1);
+        enc.dispatch_threads(grid, tg);
+        enc.end_encoding();
+
+        if use_pbpr {
+            // PBPR Stage 1 + Stage 2 (same command buffer as accumulation)
+            let gpb = ctx.acquire_buffer(
+                (num_active * num_reduce_threads * 24 * 4) as u64,
+            );
+            let rpb = ctx.acquire_buffer(8);
+            unsafe {
+                let p = rpb.contents() as *mut u32;
+                *p = num_buckets as u32;
+                *p.add(1) = num_reduce_threads as u32;
+            }
 
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
-            enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&params_buf), 0);
+            enc.set_buffer(1, Some(&gpb), 0);
+            enc.set_buffer(2, Some(&rpb), 0);
             let max_tg = ctx
                 .bucket_reduce_stage1_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -1043,8 +1116,8 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
-            enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&params_buf), 0);
+            enc.set_buffer(1, Some(&gpb), 0);
+            enc.set_buffer(2, Some(&rpb), 0);
             let max_tg = ctx
                 .bucket_reduce_stage2_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
@@ -1053,12 +1126,24 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
 
-            cb.commit();
-            cb.wait_until_completed();
+            g_points_buf = Some(gpb);
+            reduce_params_buf = Some(rpb);
+        } else {
+            g_points_buf = None;
+            reduce_params_buf = None;
         }
 
+        cb.commit();
+        cb.wait_until_completed();
+    } else {
+        g_points_buf = None;
+        reduce_params_buf = None;
+    }
+
+    if use_pbpr && num_active > 0 {
         // Read back all g_points (Jacobian → projective conversion)
-        let g_ptr = g_points_buf.contents() as *const u64;
+        let gpb = g_points_buf.as_ref().unwrap();
+        let g_ptr = gpb.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
             let mut window_sum = G1::identity();
             for t in 0..num_reduce_threads {
@@ -1069,8 +1154,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             }
             window_results.push((w, window_sum));
         }
-        extra_bufs.push(g_points_buf);
-        extra_bufs.push(params_buf);
     } else {
         let bucket_ptr = buckets_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
@@ -1106,7 +1189,8 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
 
     // Return all buffers to pool for reuse
     let mut bufs = vec![bases_buf, scatter_buf, offsets_buf, buckets_buf, window_params_buf];
-    bufs.extend(extra_bufs);
+    if let Some(b) = g_points_buf { bufs.push(b); }
+    if let Some(b) = reduce_params_buf { bufs.push(b); }
     ctx.release_buffers(bufs);
 
     total_acc
@@ -1117,204 +1201,6 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
 // ---------------------------------------------------------------------------
 
 use crate::msm::get_booth_index;
-
-/// Build CSR scatter table for one Pippenger window (GLV variant).
-///
-/// Handles 2n points: indices 0..n for k1 bases, n..2n for k2 (endomorphism) bases.
-fn build_scatter_table_glv(
-    window: usize,
-    c: usize,
-    num_buckets: usize,
-    n: usize,
-    k1_bytes: &[[u8; 16]],
-    k1_signs: &[bool],
-    k2_bytes: &[[u8; 16]],
-    k2_signs: &[bool],
-) -> (Vec<u32>, Vec<u32>) {
-    // First pass: count entries per bucket
-    let mut counts = vec![0u32; num_buckets];
-
-    for i in 0..n {
-        let idx1 = get_booth_index(window, c, &k1_bytes[i]);
-        if idx1 != 0 {
-            counts[idx1.unsigned_abs() as usize - 1] += 1;
-        }
-        let idx2 = get_booth_index(window, c, &k2_bytes[i]);
-        if idx2 != 0 {
-            counts[idx2.unsigned_abs() as usize - 1] += 1;
-        }
-    }
-
-    // Build prefix sums
-    let mut bucket_offsets = vec![0u32; num_buckets + 1];
-    for i in 0..num_buckets {
-        bucket_offsets[i + 1] = bucket_offsets[i] + counts[i];
-    }
-    let total = bucket_offsets[num_buckets] as usize;
-
-    // Second pass: fill scatter entries
-    let mut scatter_entries = vec![0u32; total];
-    let mut write_pos = bucket_offsets[..num_buckets].to_vec();
-
-    for i in 0..n {
-        let idx1 = get_booth_index(window, c, &k1_bytes[i]);
-        if idx1 != 0 {
-            let booth_positive = idx1.is_positive();
-            let effective_positive = booth_positive ^ (!k1_signs[i]);
-            let buck = idx1.unsigned_abs() as usize - 1;
-            let pos = write_pos[buck] as usize;
-            scatter_entries[pos] = (i as u32) | ((effective_positive as u32) << 31);
-            write_pos[buck] += 1;
-        }
-
-        let idx2 = get_booth_index(window, c, &k2_bytes[i]);
-        if idx2 != 0 {
-            let booth_positive = idx2.is_positive();
-            let effective_positive = booth_positive ^ (!k2_signs[i]);
-            let buck = idx2.unsigned_abs() as usize - 1;
-            let pos = write_pos[buck] as usize;
-            scatter_entries[pos] = ((n + i) as u32) | ((effective_positive as u32) << 31);
-            write_pos[buck] += 1;
-        }
-    }
-
-    (bucket_offsets, scatter_entries)
-}
-
-/// Build CSR scatter table for one Pippenger window.
-/// The counting and filling are sequential within each window, but windows
-/// themselves are built in parallel at the call site.
-fn build_scatter_table(
-    window: usize,
-    c: usize,
-    num_buckets: usize,
-    coeffs_bytes: &[impl AsRef<[u8]> + Sync],
-) -> (Vec<u32>, Vec<u32>) {
-    let n = coeffs_bytes.len();
-
-    // First pass: count entries per bucket
-    let mut counts = vec![0u32; num_buckets];
-    for coeff in coeffs_bytes.iter() {
-        let idx = get_booth_index(window, c, coeff.as_ref());
-        if idx != 0 {
-            counts[idx.unsigned_abs() as usize - 1] += 1;
-        }
-    }
-
-    // Build prefix sums (offsets)
-    let mut bucket_offsets = vec![0u32; num_buckets + 1];
-    for i in 0..num_buckets {
-        bucket_offsets[i + 1] = bucket_offsets[i] + counts[i];
-    }
-    let total = bucket_offsets[num_buckets] as usize;
-
-    // Second pass: fill scatter entries (packed: base_idx | sign<<31)
-    let mut scatter_entries = vec![0u32; total];
-    let mut write_pos = bucket_offsets[..num_buckets].to_vec();
-
-    for (base_idx, coeff) in coeffs_bytes.iter().enumerate() {
-        let idx = get_booth_index(window, c, coeff.as_ref());
-        if idx != 0 {
-            let sign = idx.is_positive() as u32;
-            let buck = idx.unsigned_abs() as usize - 1;
-            let pos = write_pos[buck] as usize;
-            scatter_entries[pos] = (base_idx as u32) | (sign << 31);
-            write_pos[buck] += 1;
-        }
-    }
-
-    (bucket_offsets, scatter_entries)
-}
-
-/// Build CSR scatter tables for all windows.
-///
-/// Fused encode+scatter: converts each scalar to bytes once, extracts all
-/// windows' Booth indices, and stores in column-major layout [window][scalar]
-/// as i16. Then each window builds its scatter table from the precomputed
-/// i16 array with sequential access.
-///
-/// Reduces total memory bandwidth vs the original approach:
-/// - Original: N×32B encode + W×N×32B scatter = N×32B×(W+1)
-/// - Fused: N×32B encode+extract + W×N×2B scatter = N×(32B + W×2B)
-/// For k=24, c=16: 512MB + 537MB = 1049MB vs original 8.5GB (8× reduction).
-fn build_scatter_tables_fused(
-    c: usize,
-    num_buckets: usize,
-    number_of_windows: usize,
-    coeffs_bytes: &[impl AsRef<[u8]> + Sync],
-) -> Vec<(Vec<u32>, Vec<u32>)> {
-    use rayon::prelude::*;
-
-    let n = coeffs_bytes.len();
-    if n == 0 {
-        return (0..number_of_windows)
-            .map(|_| (vec![0u32; num_buckets + 1], Vec::new()))
-            .collect();
-    }
-
-    // ─── Phase 1: Extract Booth indices (column-major) ────────────────
-    // Layout: booth[w * n + i] = Booth index for window w, scalar i.
-    // Column-major so Phase 2 has sequential access per window.
-    let mut booth = vec![0i16; number_of_windows * n];
-
-    // Parallel extraction: each scalar writes to indices [w*n + i] for all w.
-    // Writes to different columns (i) don't conflict.
-    let booth_addr = booth.as_mut_ptr() as usize;
-    coeffs_bytes
-        .par_iter()
-        .enumerate()
-        .for_each(|(i, coeff)| {
-            let bytes = coeff.as_ref();
-            let ptr = booth_addr as *mut i16;
-            for w in 0..number_of_windows {
-                let idx = get_booth_index(w, c, bytes);
-                // SAFETY: each scalar i writes to distinct positions [w*n + i]
-                // across all windows. No two scalars share the same position.
-                unsafe {
-                    *ptr.add(w * n + i) = idx as i16;
-                }
-            }
-        });
-
-    // ─── Phase 2: Build scatter tables from precomputed i16 arrays ────
-    // Each window gets a contiguous [n]-length i16 slice → sequential access.
-    (0..number_of_windows)
-        .into_par_iter()
-        .map(|w| {
-            let booth_slice = &booth[w * n..(w + 1) * n];
-
-            // Pass 1: count
-            let mut counts = vec![0u32; num_buckets];
-            for &idx in booth_slice {
-                if idx != 0 {
-                    counts[idx.unsigned_abs() as usize - 1] += 1;
-                }
-            }
-
-            // Prefix-sum
-            let mut bucket_offsets = vec![0u32; num_buckets + 1];
-            for b in 0..num_buckets {
-                bucket_offsets[b + 1] = bucket_offsets[b] + counts[b];
-            }
-            let total = bucket_offsets[num_buckets] as usize;
-
-            // Pass 2: fill
-            let mut scatter_entries = vec![0u32; total];
-            let mut write_pos = bucket_offsets[..num_buckets].to_vec();
-            for (i, &idx) in booth_slice.iter().enumerate() {
-                if idx != 0 {
-                    let sign = (idx > 0) as u32;
-                    let buck = idx.unsigned_abs() as usize - 1;
-                    let pos = write_pos[buck] as usize;
-                    scatter_entries[pos] = (i as u32) | (sign << 31);
-                    write_pos[buck] += 1;
-                }
-            }
-
-            (bucket_offsets, scatter_entries)
-        })
-        .collect()
-}
 
 /// Optimal Pippenger window size for GPU.
 ///

@@ -770,3 +770,33 @@ fn test_msm_gpu_pool_reuse() {
         }
     }
 }
+
+/// GLV timing test — measures msm_gpu_glv performance at key sizes.
+/// Run with: cargo test --features gpu --release -- test_msm_gpu_glv_timing --nocapture --ignored
+#[test]
+#[ignore]
+fn test_msm_gpu_glv_timing() {
+    for k in [14, 18, 20, 22] {
+        let n = 1usize << k;
+        let points_proj: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+        let mut points = vec![G1Affine::identity(); n];
+        G1::batch_normalize(&points_proj, &mut points);
+
+        // Warmup
+        let scalars: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+        let _ = crate::gpu::msm_gpu_glv(&scalars, &points);
+
+        // Timed runs
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let scalars: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+            let t0 = std::time::Instant::now();
+            let _ = crate::gpu::msm_gpu_glv(&scalars, &points);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = times[2];
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        eprintln!("k={k:2} | n={n:>10} | glv median={median:.1}ms mean={mean:.1}ms | all: {:.1?}", times);
+    }
+}
