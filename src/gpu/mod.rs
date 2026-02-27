@@ -10,7 +10,7 @@
 //! Requires the `gpu` feature flag and an Apple Silicon (or other Metal-capable) device.
 
 use metal::*;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 mod shader;
 
@@ -21,10 +21,57 @@ mod tests;
 // Metal infrastructure (lazy-initialized singletons)
 // ---------------------------------------------------------------------------
 
+/// Pool of reusable Metal buffers to avoid repeated kernel VM allocation.
+///
+/// Metal's `new_buffer()` with `StorageModeShared` involves kernel page-fault
+/// allocation. For large buffers (48-64MB), this takes 50-200ms. By reusing
+/// buffers across MSM calls, we amortize this cost to the first call only.
+///
+/// Strategy: best-fit with capacity rounding. Buffers are indexed by capacity
+/// and reused when a buffer of sufficient size is available.
+struct BufferPool {
+    /// Available buffers sorted by capacity (ascending).
+    available: Vec<(u64, Buffer)>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self { available: Vec::new() }
+    }
+
+    /// Acquire a buffer with at least `min_bytes` capacity.
+    /// Returns a pooled buffer if available, otherwise allocates a new one.
+    /// The returned buffer's contents are NOT zeroed — caller must initialize.
+    fn acquire(&mut self, device: &Device, min_bytes: u64) -> Buffer {
+        // Find the smallest buffer that fits (best-fit to minimize waste)
+        if let Some(pos) = self.available.iter().position(|(cap, _)| *cap >= min_bytes) {
+            return self.available.remove(pos).1;
+        }
+        // No suitable buffer — allocate exactly what's needed.
+        // Don't over-allocate: Metal shared buffers consume physical memory immediately
+        // on Apple Silicon unified memory, so wasting capacity = wasting RAM.
+        device.new_buffer(min_bytes.max(64), MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Return a buffer to the pool for future reuse.
+    fn release(&mut self, buf: Buffer) {
+        let cap = buf.length();
+        // Insert sorted by capacity for efficient best-fit search
+        let pos = self.available.partition_point(|(c, _)| *c < cap);
+        self.available.insert(pos, (cap, buf));
+
+        // Cap pool size to avoid unbounded memory growth (keep at most 16 buffers)
+        while self.available.len() > 16 {
+            self.available.pop(); // drop largest
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct GpuContext {
     device: Device,
     queue: CommandQueue,
+    buffer_pool: Mutex<BufferPool>,
     field_test_pipeline: ComputePipelineState,
     field_addsub_test_pipeline: ComputePipelineState,
     field_sqr_test_pipeline: ComputePipelineState,
@@ -160,6 +207,7 @@ pub(crate) fn gpu_ctx() -> &'static GpuContext {
         GpuContext {
             device,
             queue,
+            buffer_pool: Mutex::new(BufferPool::new()),
             field_test_pipeline,
             field_addsub_test_pipeline,
             field_sqr_test_pipeline,
@@ -175,6 +223,26 @@ pub(crate) fn gpu_ctx() -> &'static GpuContext {
             bucket_reduce_stage2_all_pipeline,
         }
     })
+}
+
+impl GpuContext {
+    /// Acquire a buffer from the pool (or allocate if none available).
+    fn acquire_buffer(&self, min_bytes: u64) -> Buffer {
+        self.buffer_pool.lock().unwrap().acquire(&self.device, min_bytes)
+    }
+
+    /// Return a buffer to the pool for future reuse.
+    fn release_buffer(&self, buf: Buffer) {
+        self.buffer_pool.lock().unwrap().release(buf);
+    }
+
+    /// Release multiple buffers back to the pool.
+    fn release_buffers(&self, bufs: Vec<Buffer>) {
+        let mut pool = self.buffer_pool.lock().unwrap();
+        for buf in bufs {
+            pool.release(buf);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +491,8 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     let number_of_windows = num_bits / c + 1;
     timing.num_windows = number_of_windows;
 
-    // Allocate GPU buffer for bases
-    let bases_buf = ctx.device.new_buffer(
-        bases_byte_len as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    // Allocate GPU buffer for bases (from pool to avoid repeated VM allocation)
+    let bases_buf = ctx.acquire_buffer(bases_byte_len as u64);
 
     // Start base packing on background thread (pure memcpy, doesn't need rayon)
     let bases_dst = bases_buf.contents() as usize; // usize is Send
@@ -552,10 +617,10 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     debug_assert!(total_scatter_entries <= u32::MAX as usize,
         "msm_gpu: total_scatter_entries ({total_scatter_entries}) exceeds u32::MAX");
 
-    let scatter_buf = ctx.device.new_buffer(scatter_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let offsets_buf = ctx.device.new_buffer(offsets_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let buckets_buf = ctx.device.new_buffer(buckets_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let window_params_buf = ctx.device.new_buffer(params_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let scatter_buf = ctx.acquire_buffer(scatter_buf_bytes);
+    let offsets_buf = ctx.acquire_buffer(offsets_buf_bytes);
+    let buckets_buf = ctx.acquire_buffer(buckets_buf_bytes);
+    let window_params_buf = ctx.acquire_buffer(params_buf_bytes);
 
     let scatter_dst = scatter_buf.contents() as *mut u32;
     let offsets_dst = offsets_buf.contents() as *mut u32;
@@ -610,8 +675,8 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         t
     } else { 0 };
 
-    let g_points_buf;
-    let reduce_params_buf;
+    let g_points_buf: Option<Buffer>;
+    let reduce_params_buf: Option<Buffer>;
 
     let t0 = Instant::now();
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
@@ -636,16 +701,12 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
 
         if use_pbpr {
             // PBPR Stage 1 + Stage 2 (same command buffer)
-            g_points_buf = ctx.device.new_buffer(
+            let gpb = ctx.acquire_buffer(
                 (num_active * num_reduce_threads * 24 * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
             );
-            reduce_params_buf = ctx.device.new_buffer(
-                (2 * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let rpb = ctx.acquire_buffer(8);
             unsafe {
-                let p = reduce_params_buf.contents() as *mut u32;
+                let p = rpb.contents() as *mut u32;
                 *p = num_buckets as u32;
                 *p.add(1) = num_reduce_threads as u32;
             }
@@ -653,8 +714,8 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
-            enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&reduce_params_buf), 0);
+            enc.set_buffer(1, Some(&gpb), 0);
+            enc.set_buffer(2, Some(&rpb), 0);
             let max_tg = ctx.bucket_reduce_stage1_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
             let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
@@ -665,32 +726,35 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
             enc.set_buffer(0, Some(&buckets_buf), 0);
-            enc.set_buffer(1, Some(&g_points_buf), 0);
-            enc.set_buffer(2, Some(&reduce_params_buf), 0);
+            enc.set_buffer(1, Some(&gpb), 0);
+            enc.set_buffer(2, Some(&rpb), 0);
             let max_tg = ctx.bucket_reduce_stage2_all_pipeline
                 .max_total_threads_per_threadgroup() as u64;
             let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
             let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
             enc.dispatch_threads(grid, tg);
             enc.end_encoding();
+
+            g_points_buf = Some(gpb);
+            reduce_params_buf = Some(rpb);
         } else {
-            // Dummy assignments so variables are always initialized
-            g_points_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
-            reduce_params_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+            g_points_buf = None;
+            reduce_params_buf = None;
         }
 
         cb.commit();
         cb.wait_until_completed();
     } else {
-        g_points_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
-        reduce_params_buf = ctx.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        g_points_buf = None;
+        reduce_params_buf = None;
     }
     if timed { timing.gpu_kernel_ms = t0.elapsed().as_secs_f64() * 1000.0; }
 
     if use_pbpr && num_active > 0 {
         // Read back all g_points (Jacobian → projective conversion)
         let t0 = Instant::now();
-        let g_ptr = g_points_buf.contents() as *const u64;
+        let gpb = g_points_buf.as_ref().unwrap();
+        let g_ptr = gpb.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
             let mut window_sum = G1::identity();
             for t in 0..num_reduce_threads {
@@ -739,6 +803,12 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         }
     }
     if timed { timing.cpu_reduce_ms += t0.elapsed().as_secs_f64() * 1000.0; }
+
+    // Return all buffers to pool for reuse in subsequent MSM calls
+    let mut bufs = vec![bases_buf, scatter_buf, offsets_buf, buckets_buf, window_params_buf];
+    if let Some(b) = g_points_buf { bufs.push(b); }
+    if let Some(b) = reduce_params_buf { bufs.push(b); }
+    ctx.release_buffers(bufs);
 
     timing.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     (total_acc, timing)
@@ -792,10 +862,7 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     let zeta = <Fq as WithSmallOrderMulGroup<3>>::ZETA;
     let total_points = 2 * n;
     let bases_byte_len = total_points * 16 * 4;
-    let bases_buf = ctx.device.new_buffer(
-        bases_byte_len as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let bases_buf = ctx.acquire_buffer(bases_byte_len as u64);
 
     // Window parameters for ~128-bit scalars
     let half_bits = 128usize;
@@ -867,10 +934,10 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     debug_assert!(total_scatter_entries <= u32::MAX as usize);
     debug_assert!((2 * n) <= (1usize << 31));
 
-    let scatter_buf = ctx.device.new_buffer(scatter_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let offsets_buf = ctx.device.new_buffer(offsets_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let buckets_buf = ctx.device.new_buffer(buckets_buf_bytes, MTLResourceOptions::StorageModeShared);
-    let window_params_buf = ctx.device.new_buffer(params_buf_bytes, MTLResourceOptions::StorageModeShared);
+    let scatter_buf = ctx.acquire_buffer(scatter_buf_bytes);
+    let offsets_buf = ctx.acquire_buffer(offsets_buf_bytes);
+    let buckets_buf = ctx.acquire_buffer(buckets_buf_bytes);
+    let window_params_buf = ctx.acquire_buffer(params_buf_bytes);
 
     let scatter_dst = scatter_buf.contents() as *mut u32;
     let offsets_dst = offsets_buf.contents() as *mut u32;
@@ -943,15 +1010,13 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
 
     let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
 
+    let mut extra_bufs: Vec<Buffer> = Vec::new();
+
     if use_pbpr && num_active > 0 {
-        let g_points_buf = ctx.device.new_buffer(
+        let g_points_buf = ctx.acquire_buffer(
             (num_active * num_reduce_threads * 24 * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
         );
-        let params_buf = ctx.device.new_buffer(
-            (2 * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let params_buf = ctx.acquire_buffer(8);
         unsafe {
             let p = params_buf.contents() as *mut u32;
             *p = num_buckets as u32;
@@ -1004,6 +1069,8 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             }
             window_results.push((w, window_sum));
         }
+        extra_bufs.push(g_points_buf);
+        extra_bufs.push(params_buf);
     } else {
         let bucket_ptr = buckets_buf.contents() as *const u64;
         for (i, &w) in active_windows.iter().enumerate() {
@@ -1036,6 +1103,11 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             total_acc = total_acc + pt;
         }
     }
+
+    // Return all buffers to pool for reuse
+    let mut bufs = vec![bases_buf, scatter_buf, offsets_buf, buckets_buf, window_params_buf];
+    bufs.extend(extra_bufs);
+    ctx.release_buffers(bufs);
 
     total_acc
 }

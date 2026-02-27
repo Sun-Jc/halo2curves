@@ -745,3 +745,28 @@ fn test_msm_gpu_timing() {
         );
     }
 }
+
+/// Buffer pool reuse test — calls MSM 5 times at the same k to measure warm-pool benefit.
+/// Run with: cargo test --features gpu --release -- test_msm_gpu_pool_reuse --nocapture --ignored
+#[test]
+#[ignore]
+fn test_msm_gpu_pool_reuse() {
+    for k in [18, 20, 22] {
+        let n = 1usize << k;
+        let points_proj: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+        let mut points = vec![G1Affine::identity(); n];
+        G1::batch_normalize(&points_proj, &mut points);
+
+        eprintln!("\n=== k={k} (n={n}) — 5 consecutive MSM calls ===");
+        for iter in 0..5 {
+            // Fresh scalars each time to avoid any caching of scalar-dependent work
+            let scalars: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+            let (_result, timing) = crate::gpu::msm_gpu_timed(&scalars, &points);
+            eprintln!("  iter {iter}: upload={up:.1}ms kernel={gk:.1}ms total={tot:.1}ms",
+                up = timing.gpu_upload_ms,
+                gk = timing.gpu_kernel_ms,
+                tot = timing.total_ms,
+            );
+        }
+    }
+}
