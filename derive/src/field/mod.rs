@@ -564,11 +564,11 @@ pub(crate) fn impl_field(input: TokenStream) -> TokenStream {
         if num_limbs == 4 && num_bits < 256 {
             asm::limb4::impl_arith(&field, inv64)
         } else {
-            arith::impl_arith(&field, num_limbs, inv64)
+            arith::impl_arith(&field, num_limbs, inv64, &modulus_limbs)
         }
     };
     #[cfg(not(feature = "asm"))]
-    let impl_arith = arith::impl_arith(&field, num_limbs, inv64);
+    let impl_arith = arith::impl_arith(&field, num_limbs, inv64, &modulus_limbs);
 
     let impl_arith_always_const = arith::impl_arith_always_const(&field, num_limbs, inv64);
 

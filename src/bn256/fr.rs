@@ -36,11 +36,12 @@ impl From<u64> for Fr {
         if val < 65536 {
             FR_TABLE[val as usize]
         } else {
-            Self([val, 0, 0, 0]) * Fr::R2
+            Self::R2.mul_by_u64(val)
         }
     }
 }
 crate::impl_from_bool!(Fr);
+crate::impl_integer_mul_ops!(Fr);
 
 #[cfg(feature = "bn256-table")]
 #[rustfmt::skip]

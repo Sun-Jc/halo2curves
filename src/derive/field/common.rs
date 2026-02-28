@@ -53,14 +53,9 @@ macro_rules! impl_from_u64 {
     ($field:ident) => {
         impl From<u64> for $field {
             fn from(val: u64) -> $field {
-                let limbs = core::iter::once(val)
-                    .chain(core::iter::repeat(0))
-                    .take(Self::NUM_LIMBS)
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap();
-
-                $field(limbs) * Self::R2
+                // mul_by_u64 uses Barrett reduction: self.0 x val mod p.
+                // For R (Montgomery one, stores R in limbs): R x val mod p = val*R mod p 
+                Self::R.mul_by_u64(val)
             }
         }
     };
@@ -71,14 +66,7 @@ macro_rules! impl_from_bool {
     ($field:ident) => {
         impl From<bool> for $field {
             fn from(val: bool) -> $field {
-                let limbs = core::iter::once(u64::from(val))
-                    .chain(core::iter::repeat(0))
-                    .take(Self::NUM_LIMBS)
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap();
-
-                $field(limbs) * Self::R2
+                Self::R.mul_by_u64(u64::from(val))
             }
         }
     };
@@ -117,6 +105,104 @@ macro_rules! serialize_deserialize_primefield {
                     let bytes: [u8; $field::SIZE] = self.to_repr().into();
                     ::serde_arrays::serialize(&bytes, serializer)
                 }
+            }
+        }
+    };
+}
+
+/// Implements `Mul` and `MulAssign` for integer scalar types (u32, u64, i32, i128).
+///
+/// `mul_by_u64` uses Barrett reduction: sparse multiply (N macs) + Barrett reduce (~2N ops).
+/// This is faster than From(rhs) + field_mul which costs N+N^2 + N^2 = 2N^2+N mac ops.
+/// For signed types, multiplies by absolute value and conditionally negates.
+#[macro_export]
+macro_rules! impl_integer_mul_ops {
+    ($field:ident) => {
+        // --- Mul<u64> ---
+        impl ::core::ops::Mul<u64> for $field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: u64) -> $field {
+                self.mul_by_u64(rhs)
+            }
+        }
+        impl ::core::ops::Mul<u64> for &$field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: u64) -> $field {
+                self.mul_by_u64(rhs)
+            }
+        }
+        impl ::core::ops::MulAssign<u64> for $field {
+            #[inline]
+            fn mul_assign(&mut self, rhs: u64) {
+                *self = self.mul_by_u64(rhs);
+            }
+        }
+
+        // --- Mul<u32> ---
+        impl ::core::ops::Mul<u32> for $field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: u32) -> $field {
+                self.mul_by_u32(rhs)
+            }
+        }
+        impl ::core::ops::Mul<u32> for &$field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: u32) -> $field {
+                self.mul_by_u32(rhs)
+            }
+        }
+        impl ::core::ops::MulAssign<u32> for $field {
+            #[inline]
+            fn mul_assign(&mut self, rhs: u32) {
+                *self = self.mul_by_u32(rhs);
+            }
+        }
+
+        // --- Mul<i32> ---
+        impl ::core::ops::Mul<i32> for $field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: i32) -> $field {
+                self.mul_by_i32(rhs)
+            }
+        }
+        impl ::core::ops::Mul<i32> for &$field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: i32) -> $field {
+                self.mul_by_i32(rhs)
+            }
+        }
+        impl ::core::ops::MulAssign<i32> for $field {
+            #[inline]
+            fn mul_assign(&mut self, rhs: i32) {
+                *self = self.mul_by_i32(rhs);
+            }
+        }
+
+        // --- Mul<i128> ---
+        impl ::core::ops::Mul<i128> for $field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: i128) -> $field {
+                self.mul_by_i128(rhs)
+            }
+        }
+        impl ::core::ops::Mul<i128> for &$field {
+            type Output = $field;
+            #[inline]
+            fn mul(self, rhs: i128) -> $field {
+                self.mul_by_i128(rhs)
+            }
+        }
+        impl ::core::ops::MulAssign<i128> for $field {
+            #[inline]
+            fn mul_assign(&mut self, rhs: i128) {
+                *self = self.mul_by_i128(rhs);
             }
         }
     };
