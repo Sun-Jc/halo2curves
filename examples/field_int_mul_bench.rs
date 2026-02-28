@@ -13,7 +13,7 @@ use ark_ff::UniformRand;
 use ark_test_curves::bn254::Fr as ArkFr;
 
 // halo2curves
-use halo2curves::bn256::Fq as H2cFq;
+use halo2curves::bn256::Fr as H2cFr;
 use halo2curves::ff::Field as H2cField;
 
 use rand_core::SeedableRng;
@@ -50,8 +50,8 @@ fn bench(log_n: u32) {
 
     // halo2curves elements
     let mut rng_h2c = XorShiftRng::from_seed(SEED);
-    let h2c_elems: Vec<H2cFq> = (0..n).map(|_| H2cFq::random(&mut rng_h2c)).collect();
-    let h2c_scalar_fields: Vec<H2cFq> = scalars_u64.iter().map(|&s| H2cFq::from(s)).collect();
+    let h2c_elems: Vec<H2cFr> = (0..n).map(|_| H2cFr::random(&mut rng_h2c)).collect();
+    let h2c_scalar_fields: Vec<H2cFr> = scalars_u64.iter().map(|&s| H2cFr::from(s)).collect();
 
     // Helper: time a loop
     macro_rules! time_loop {
@@ -68,44 +68,44 @@ fn bench(log_n: u32) {
     // ===== FxF =====
     let ark_fxf = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]) * std::hint::black_box(ark_scalar_fields[i]));
-    let h2c_fxf = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_fxf = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(h2c_scalar_fields[i]));
 
     // ===== Fxu64 =====
     let ark_u64 = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]).mul_u64::<5>(std::hint::black_box(scalars_u64[i])));
-    let h2c_u64 = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_u64 = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(scalars_u64[i]));
 
     // ===== Fxu32 =====
     let ark_u32 = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]).mul_u64::<5>(std::hint::black_box(scalars_u32[i]) as u64));
-    let h2c_u32 = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_u32 = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(scalars_u32[i]));
 
     // ===== Fxi32 =====
     let ark_i32 = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]).mul_i64::<5>(std::hint::black_box(scalars_i32[i]) as i64));
-    let h2c_i32 = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_i32 = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(scalars_i32[i]));
 
     // ===== Fxi128 (large, > u64) =====
     let ark_i128 = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]).mul_i128::<5, 6>(std::hint::black_box(scalars_i128[i])));
-    let h2c_i128 = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_i128 = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(scalars_i128[i]));
 
     // ===== Fxi128 (small, fits u64) =====
     let ark_i128s = time_loop!(ArkFr::from(0u64), |i: usize|
         std::hint::black_box(ark_elems[i]).mul_i128::<5, 6>(std::hint::black_box(scalars_i128_small[i])));
-    let h2c_i128s = time_loop!(H2cFq::ZERO, |i: usize|
+    let h2c_i128s = time_loop!(H2cFr::ZERO, |i: usize|
         std::hint::black_box(h2c_elems[i]) * std::hint::black_box(scalars_i128_small[i]));
 
     // ===== From<u64> =====
     let ark_from = time_loop!(ArkFr::from(0u64), |i: usize|
         ArkFr::from(std::hint::black_box(scalars_u64[i])));
-    let h2c_from = time_loop!(H2cFq::ZERO, |i: usize|
-        H2cFq::from(std::hint::black_box(scalars_u64[i])));
+    let h2c_from = time_loop!(H2cFr::ZERO, |i: usize|
+        H2cFr::from(std::hint::black_box(scalars_u64[i])));
 
     // Print
     let ns = |d: std::time::Duration| d.as_nanos() as f64 / n as f64;
