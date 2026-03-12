@@ -219,6 +219,13 @@ inline bool fq_is_zero(thread const uint* a) {
     return v == 0;
 }
 
+// ---- Equality (Montgomery form, no reduction needed) ----
+inline bool fq_eq(thread const uint* a, thread const uint* b) {
+    uint v = 0;
+    for (int i = 0; i < 8; i++) v |= (a[i] ^ b[i]);
+    return v == 0;
+}
+
 // ---- Copy ----
 inline void fq_copy(thread const uint* src, thread uint* dst) {
     for (int i = 0; i < 8; i++) dst[i] = src[i];
@@ -242,6 +249,13 @@ inline void fq_store(thread const uint* src, device uint* dst) {
 // Identity: any (X, Y, 0) — we use Z=0 convention
 // Affine point (x, y) → Jacobian (x, y, 1)
 // Negation: (X, -Y, Z)
+
+// Forward declaration — jacobian_dbl is used by the complete addition functions
+// below but defined after them in the source.
+inline void jacobian_dbl(
+    thread const uint* x1, thread const uint* y1, thread const uint* z1,
+    thread uint* x3, thread uint* y3, thread uint* z3
+);
 
 // ---- Jacobian mixed addition: R = P + Q ----
 // P = (X1, Y1, Z1) Jacobian, Q = (x2, y2) affine (Z2 = 1)
@@ -292,12 +306,74 @@ inline void jacobian_madd(
     fq_sub(z3, HH, z3);         // Z3 = (Z1+H)^2 - Z1Z1 - HH
 }
 
+// ---- Complete mixed addition: R = P + Q ----
+// P = (X1, Y1, Z1) Jacobian, Q = (x2, y2) affine
+// Handles P == Q (doubling) and P == -Q (returns identity).
+inline void jacobian_madd_complete(
+    thread const uint* x1, thread const uint* y1, thread const uint* z1,
+    thread const uint* x2, thread const uint* y2,
+    thread uint* x3, thread uint* y3, thread uint* z3
+) {
+    uint Z1Z1[8], U2[8], S2[8], H[8], r[8];
+    uint t1[8];
+
+    fq_sqr(z1, Z1Z1);           // Z1Z1 = Z1^2
+    fq_mul(x2, Z1Z1, U2);       // U2 = x2 * Z1Z1
+    fq_mul(z1, Z1Z1, t1);       // t1 = Z1^3
+    fq_mul(y2, t1, S2);         // S2 = y2 * Z1^3
+    fq_sub(U2, x1, H);          // H = U2 - X1
+    fq_sub(S2, y1, r);          // r = S2 - Y1 (half of the doubled r)
+
+    if (fq_is_zero(H)) {
+        if (fq_is_zero(r)) {
+            // P == Q → doubling
+            jacobian_dbl(x1, y1, z1, x3, y3, z3);
+        } else {
+            // P == -Q → identity
+            for (int i = 0; i < 8; i++) x3[i] = FQ_ONE[i];
+            for (int i = 0; i < 8; i++) y3[i] = FQ_ONE[i];
+            for (int i = 0; i < 8; i++) z3[i] = 0;
+        }
+        return;
+    }
+
+    // Common case: H ≠ 0, proceed with standard formula
+    uint HH[8], I[8], J[8], V[8];
+
+    fq_sqr(H, HH);              // HH = H^2
+    fq_dbl(HH, I);              // I = 2*HH
+    fq_dbl(I, I);               // I = 4*HH
+    fq_mul(H, I, J);            // J = H * I
+    fq_dbl(r, r);               // r = 2*(S2 - Y1)
+    fq_mul(x1, I, V);           // V = X1 * I
+
+    // X3 = r^2 - J - 2*V
+    fq_sqr(r, x3);
+    fq_sub(x3, J, x3);
+    fq_dbl(V, t1);
+    fq_sub(x3, t1, x3);
+
+    // Y3 = r*(V - X3) - 2*Y1*J
+    fq_mul(y1, J, t1);          // must read y1 BEFORE writing y3
+    fq_dbl(t1, t1);
+    uint t2[8];
+    fq_sub(V, x3, t2);
+    fq_mul(r, t2, y3);
+    fq_sub(y3, t1, y3);
+
+    // Z3 = (Z1+H)^2 - Z1Z1 - HH
+    fq_add(z1, H, t1);
+    fq_sqr(t1, z3);
+    fq_sub(z3, Z1Z1, z3);
+    fq_sub(z3, HH, z3);
+}
+
 // ---- Full Jacobian addition: R = P + Q ----
 // P = (X1, Y1, Z1), Q = (X2, Y2, Z2), both Jacobian
 // add-2007-bl from https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html
 // Cost: 11M + 5S + 9add + 4×2
-// NOT complete: fails when P = ±Q. Safe for PBPR since bucket points are random.
-// Supports output aliasing input via local temporaries.
+// NOT complete: fails when P = ±Q. Use jacobian_add_complete for general use.
+// Kept for the test kernel compatibility.
 inline void jacobian_add(
     thread const uint* x1, thread const uint* y1, thread const uint* z1,
     thread const uint* x2, thread const uint* y2, thread const uint* z2,
@@ -320,6 +396,75 @@ inline void jacobian_add(
     fq_sqr(t1, I);                 // I = (2*H)^2
     fq_mul(H, I, J);               // J = H * I
     fq_sub(S2, S1, r);             // r = S2 - S1
+    fq_dbl(r, r);                  // r = 2*(S2-S1)
+    fq_mul(U1, I, V);              // V = U1 * I
+
+    // X3 = r^2 - J - 2*V
+    fq_sqr(r, x3);
+    fq_sub(x3, J, x3);
+    fq_dbl(V, t1);
+    fq_sub(x3, t1, x3);
+
+    // Y3 = r*(V-X3) - 2*S1*J
+    fq_sub(V, x3, t1);
+    fq_mul(r, t1, y3);
+    fq_mul(S1, J, t1);
+    fq_dbl(t1, t1);
+    fq_sub(y3, t1, y3);
+
+    // Z3 = ((Z1+Z2)^2 - Z1Z1 - Z2Z2) * H
+    fq_add(z1, z2, t1);
+    fq_sqr(t1, t2);
+    fq_sub(t2, Z1Z1, t2);
+    fq_sub(t2, Z2Z2, t2);
+    fq_mul(t2, H, z3);
+}
+
+// ---- Complete Jacobian addition: R = P + Q ----
+// Same as jacobian_add but handles P = ±Q correctly:
+//   H = 0 and r = 0  ⇒  P == Q  ⇒  use doubling
+//   H = 0 and r ≠ 0  ⇒  P == -Q ⇒  return identity (Z = 0)
+// Cost: same as jacobian_add + 2 fq_is_zero checks on the rare P==±Q path.
+// The common-case fast path (H ≠ 0) is unchanged.
+inline void jacobian_add_complete(
+    thread const uint* x1, thread const uint* y1, thread const uint* z1,
+    thread const uint* x2, thread const uint* y2, thread const uint* z2,
+    thread uint* x3, thread uint* y3, thread uint* z3
+) {
+    uint Z1Z1[8], Z2Z2[8], U1[8], U2[8], S1[8], S2[8];
+    uint H[8], r[8];
+    uint t1[8];
+
+    fq_sqr(z1, Z1Z1);              // Z1Z1 = Z1^2
+    fq_sqr(z2, Z2Z2);              // Z2Z2 = Z2^2
+    fq_mul(x1, Z2Z2, U1);          // U1 = X1 * Z2Z2
+    fq_mul(x2, Z1Z1, U2);          // U2 = X2 * Z1Z1
+    fq_mul(z2, Z2Z2, t1);          // t1 = Z2^3
+    fq_mul(y1, t1, S1);            // S1 = Y1 * Z2^3
+    fq_mul(z1, Z1Z1, t1);          // t1 = Z1^3
+    fq_mul(y2, t1, S2);            // S2 = Y2 * Z1^3
+    fq_sub(U2, U1, H);             // H = U2 - U1
+    fq_sub(S2, S1, r);             // r = S2 - S1 (half of the doubled r)
+
+    if (fq_is_zero(H)) {
+        if (fq_is_zero(r)) {
+            // P == Q → doubling
+            jacobian_dbl(x1, y1, z1, x3, y3, z3);
+        } else {
+            // P == -Q → identity
+            for (int i = 0; i < 8; i++) x3[i] = FQ_ONE[i];
+            for (int i = 0; i < 8; i++) y3[i] = FQ_ONE[i];
+            for (int i = 0; i < 8; i++) z3[i] = 0;
+        }
+        return;
+    }
+
+    // Common case: H ≠ 0, proceed with standard formula
+    uint I[8], J[8], V[8], t2[8];
+
+    fq_dbl(H, t1);                 // t1 = 2*H
+    fq_sqr(t1, I);                 // I = (2*H)^2
+    fq_mul(H, I, J);               // J = H * I
     fq_dbl(r, r);                  // r = 2*(S2-S1)
     fq_mul(U1, I, V);              // V = U1 * I
 
@@ -417,7 +562,7 @@ inline void double_and_add(
                 fq_copy(tz, rz);
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(rx, ry, rz, tx, ty, tz, ox, oy, oz);
+                jacobian_add_complete(rx, ry, rz, tx, ty, tz, ox, oy, oz);
                 fq_copy(ox, rx);
                 fq_copy(oy, ry);
                 fq_copy(oz, rz);
@@ -648,7 +793,7 @@ kernel void bucket_accumulate_all(
             fq_neg(ay, ay);
         }
 
-        jacobian_madd(accx, accy, accz, ax, ay, accx, accy, accz);
+        jacobian_madd_complete(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
     fq_store(accx, buckets_out + boff);
@@ -699,7 +844,7 @@ kernel void bucket_accumulate(
 
         if (s == 0) { fq_neg(ay, ay); }
 
-        jacobian_madd(accx, accy, accz, ax, ay, accx, accy, accz);
+        jacobian_madd_complete(accx, accy, accz, ax, ay, accx, accy, accz);
     }
 
     fq_store(accx, buckets_out + boff_out);
@@ -739,8 +884,9 @@ kernel void bucket_reduce_stage1(
     fq_copy(mz, gz);
 
     // Track if g and m are the same point (after initial copy).
-    // When g==m, jacobian_add(g,m) is P+P which fails with incomplete formula.
-    // We must use jacobian_dbl instead.
+    // jacobian_add_complete handles P==Q via doubling, but we keep this
+    // fast-path optimization to avoid the complete-add overhead when we
+    // can cheaply prove g==m from the control flow.
     bool g_equals_m = true;
 
     for (uint i = 1; i < bpt; i++) {
@@ -761,7 +907,7 @@ kernel void bucket_reduce_stage1(
             } else {
                 // m += bucket[bi]
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(mx, my, mz, bx, by, bz, ox, oy, oz);
+                jacobian_add_complete(mx, my, mz, bx, by, bz, ox, oy, oz);
                 fq_copy(ox, mx);
                 fq_copy(oy, my);
                 fq_copy(oz, mz);
@@ -787,7 +933,7 @@ kernel void bucket_reduce_stage1(
                 g_equals_m = false;
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
+                jacobian_add_complete(gx, gy, gz, mx, my, mz, ox, oy, oz);
                 fq_copy(ox, gx);
                 fq_copy(oy, gy);
                 fq_copy(oz, gz);
@@ -850,7 +996,7 @@ kernel void bucket_reduce_stage2(
                 fq_copy(daz, gz);
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
+                jacobian_add_complete(gx, gy, gz, dax, day, daz, ox, oy, oz);
                 fq_copy(ox, gx);
                 fq_copy(oy, gy);
                 fq_copy(oz, gz);
@@ -918,7 +1064,7 @@ kernel void bucket_reduce_stage1_all(
                 fq_copy(bz, mz);
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(mx, my, mz, bx, by, bz, ox, oy, oz);
+                jacobian_add_complete(mx, my, mz, bx, by, bz, ox, oy, oz);
                 fq_copy(ox, mx);
                 fq_copy(oy, my);
                 fq_copy(oz, mz);
@@ -941,7 +1087,7 @@ kernel void bucket_reduce_stage1_all(
                 g_equals_m = false;
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(gx, gy, gz, mx, my, mz, ox, oy, oz);
+                jacobian_add_complete(gx, gy, gz, mx, my, mz, ox, oy, oz);
                 fq_copy(ox, gx);
                 fq_copy(oy, gy);
                 fq_copy(oz, gz);
@@ -1009,7 +1155,7 @@ kernel void bucket_reduce_stage2_all(
                 fq_copy(daz, gz);
             } else {
                 uint ox[8], oy[8], oz[8];
-                jacobian_add(gx, gy, gz, dax, day, daz, ox, oy, oz);
+                jacobian_add_complete(gx, gy, gz, dax, day, daz, ox, oy, oz);
                 fq_copy(ox, gx);
                 fq_copy(oy, gy);
                 fq_copy(oz, gz);
