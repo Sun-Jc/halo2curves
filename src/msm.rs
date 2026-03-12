@@ -585,6 +585,110 @@ pub fn msm_best<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     acc.into_iter().sum::<_>()
 }
 
+/// Compute multiple MSMs in one call.
+///
+/// `coeffs[i]` and `bases[i]` form the i-th MSM task.  When all tasks share
+/// the same bases slice, the expensive `Affine` conversion and window-parameter
+/// computation are performed only once and reused across tasks.
+///
+/// # Panics
+/// Panics if `coeffs.len() != bases.len()` or any pair has mismatched lengths.
+#[cfg(feature = "std")]
+pub fn batch_msm_best<C: CurveAffine>(
+    coeffs: &[&[C::Scalar]],
+    bases: &[&[C]],
+) -> Vec<C::Curve> {
+    assert_eq!(coeffs.len(), bases.len());
+    if coeffs.is_empty() {
+        return Vec::new();
+    }
+    for (c, b) in coeffs.iter().zip(bases.iter()) {
+        assert_eq!(c.len(), b.len(), "coeffs and bases length mismatch in batch task");
+    }
+
+    let batch_size = coeffs.len();
+
+    // Detect shared bases: all slices point to the same data and length.
+    let shared_bases = batch_size > 1
+        && bases.iter().all(|b| {
+            core::ptr::eq(b.as_ptr(), bases[0].as_ptr()) && b.len() == bases[0].len()
+        });
+
+    if shared_bases {
+        batch_msm_shared_bases(coeffs, bases[0])
+    } else {
+        // Independent bases: parallel over tasks, each calling msm_best.
+        coeffs
+            .par_iter()
+            .zip(bases.par_iter())
+            .map(|(c, b)| msm_best(c, b))
+            .collect()
+    }
+}
+
+/// Batch MSM optimized for shared bases: precompute `Affine` copies and
+/// window parameter `c` once, reuse for all tasks.
+#[cfg(feature = "std")]
+fn batch_msm_shared_bases<C: CurveAffine>(
+    all_coeffs: &[&[C::Scalar]],
+    bases: &[C],
+) -> Vec<C::Curve> {
+    let n = bases.len();
+    let c = get_optimal_c(n);
+
+    if c < 10 {
+        return all_coeffs
+            .par_iter()
+            .map(|coeffs| msm_parallel(coeffs, bases))
+            .collect();
+    }
+
+    // Shared precomputation: convert bases to Affine once.
+    let bases_local: Vec<_> = bases.par_iter().map(Affine::from).collect();
+    let number_of_windows = C::Scalar::NUM_BITS as usize / c + 1;
+
+    all_coeffs
+        .iter()
+        .map(|coeffs| {
+            assert_eq!(coeffs.len(), n);
+
+            // Per-task: encode coefficients (must redo — different scalars)
+            let coeffs: Vec<_> = coeffs.par_iter().map(|a| a.to_repr()).collect();
+
+            // Per-task: window-parallel bucket accumulation (reuse bases_local and c)
+            let mut acc = vec![C::Curve::identity(); number_of_windows];
+            acc.par_iter_mut().enumerate().rev().for_each(|(w, acc)| {
+                let mut j_bucks = vec![Bucket::<C>::None; 1 << (c - 1)];
+                let mut sched = Schedule::new(c);
+
+                for (base_idx, coeff) in coeffs.iter().enumerate() {
+                    let buck_idx = get_booth_index(w, c, coeff.as_ref());
+                    if buck_idx != 0 {
+                        let sign = buck_idx.is_positive();
+                        let buck_idx = buck_idx.unsigned_abs() as usize - 1;
+                        if sched.contains(buck_idx) {
+                            j_bucks[buck_idx].add_assign(&bases[base_idx], sign);
+                        } else {
+                            sched.add(&bases_local, base_idx, buck_idx, sign);
+                        }
+                    }
+                }
+                sched.execute(&bases_local);
+
+                let mut running_sum = C::Curve::identity();
+                for (j_buck, a_buck) in j_bucks.iter().zip(sched.buckets.iter()).rev() {
+                    running_sum += j_buck.add(a_buck);
+                    *acc += running_sum;
+                }
+                for _ in 0..c * w {
+                    *acc = acc.double();
+                }
+            });
+            acc.into_iter().sum::<_>()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     #[cfg(not(feature = "std"))]
@@ -594,6 +698,7 @@ mod test {
     use core::ops::Neg;
     use ff::{Field, PrimeField};
     use group::{Curve, Group};
+    use group::prime::PrimeCurveAffine;
     use rand_core::OsRng;
 
     use crate::bn256::{Fr, G1Affine, G1};
@@ -684,5 +789,85 @@ mod test {
     #[cfg(feature = "std")]
     fn test_msm_cross() {
         run_msm_cross::<G1Affine>(14, 18);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_batch_msm_best_shared_bases() {
+        use plonky2_maybe_rayon::*;
+
+        let k = 14;
+        let n = 1 << k;
+        let batch_size = 5;
+
+        let points = (0..n)
+            .into_par_iter()
+            .map(|_| G1::random(OsRng))
+            .collect::<Vec<_>>();
+        let mut affine_points = vec![G1Affine::identity(); n];
+        G1::batch_normalize(&points, &mut affine_points);
+
+        let all_scalars: Vec<Vec<Fr>> = (0..batch_size)
+            .map(|_| (0..n).map(|_| Fr::random(OsRng)).collect())
+            .collect();
+
+        // Reference: per-task msm_best
+        let expected: Vec<G1> = all_scalars
+            .iter()
+            .map(|s| super::msm_best(s, &affine_points))
+            .collect();
+
+        // Batch with shared bases (same slice)
+        let coeffs_refs: Vec<&[Fr]> = all_scalars.iter().map(|s| s.as_slice()).collect();
+        let bases_refs: Vec<&[G1Affine]> = vec![affine_points.as_slice(); batch_size];
+        let actual = super::batch_msm_best(&coeffs_refs, &bases_refs);
+
+        assert_eq!(expected, actual, "batch_msm_best (shared bases) mismatch");
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_batch_msm_best_independent_bases() {
+        use plonky2_maybe_rayon::*;
+
+        let k = 14;
+        let n = 1 << k;
+        let batch_size = 3;
+
+        let all_bases: Vec<Vec<G1Affine>> = (0..batch_size)
+            .map(|_| {
+                let pts: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+                let mut aff = vec![G1Affine::identity(); n];
+                G1::batch_normalize(&pts, &mut aff);
+                aff
+            })
+            .collect();
+
+        let all_scalars: Vec<Vec<Fr>> = (0..batch_size)
+            .map(|_| (0..n).map(|_| Fr::random(OsRng)).collect())
+            .collect();
+
+        // Reference
+        let expected: Vec<G1> = all_scalars
+            .iter()
+            .zip(all_bases.iter())
+            .map(|(s, b)| super::msm_best(s, b))
+            .collect();
+
+        // Batch with independent bases (different slices)
+        let coeffs_refs: Vec<&[Fr]> = all_scalars.iter().map(|s| s.as_slice()).collect();
+        let bases_refs: Vec<&[G1Affine]> = all_bases.iter().map(|b| b.as_slice()).collect();
+        let actual = super::batch_msm_best(&coeffs_refs, &bases_refs);
+
+        assert_eq!(expected, actual, "batch_msm_best (independent bases) mismatch");
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_batch_msm_best_empty() {
+        let coeffs: Vec<&[Fr]> = vec![];
+        let bases: Vec<&[G1Affine]> = vec![];
+        let result = super::batch_msm_best(&coeffs, &bases);
+        assert!(result.is_empty());
     }
 }

@@ -92,7 +92,7 @@ static GPU_CTX: OnceLock<GpuContext> = OnceLock::new();
 /// Cached CPU-side booth index buffer to avoid repeated large allocations.
 /// On k=24 this is 512MB — re-allocating each MSM call causes significant
 /// page-fault overhead on first touch. By caching, we pay this cost only once.
-static BOOTH_CACHE: Mutex<Vec<i16>> = Mutex::new(Vec::new());
+static BOOTH_CACHE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 pub(crate) fn gpu_ctx() -> &'static GpuContext {
     GPU_CTX.get_or_init(|| {
@@ -392,6 +392,22 @@ pub fn msm_gpu<C: GpuMsm>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     C::msm_gpu_dispatch(coeffs, bases)
 }
 
+/// Compute multiple MSMs in one call with GPU acceleration.
+///
+/// For BN254 G1: reuses the Metal GPU context, bases buffer, booth cache, and
+/// working buffers across all tasks. Other curves fall back to parallel
+/// `msm_gpu_dispatch` per task.
+///
+/// # Panics
+/// Panics if `coeffs.len() != bases.len()` or any pair has mismatched lengths.
+pub fn batch_msm_gpu<C: GpuMsm>(
+    coeffs: &[&[C::Scalar]],
+    bases: &[&[C]],
+) -> Vec<C::Curve> {
+    assert_eq!(coeffs.len(), bases.len());
+    C::batch_msm_gpu_dispatch(coeffs, bases)
+}
+
 /// Trait for compile-time GPU MSM dispatch.
 ///
 /// `bn256::G1Affine` uses the Metal GPU backend; all other curve types fall
@@ -399,6 +415,19 @@ pub fn msm_gpu<C: GpuMsm>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
 pub trait GpuMsm: CurveAffine {
     #[doc(hidden)]
     fn msm_gpu_dispatch(coeffs: &[Self::Scalar], bases: &[Self]) -> Self::Curve;
+
+    /// Batch dispatch — default runs each task through msm_gpu_dispatch via rayon.
+    fn batch_msm_gpu_dispatch(
+        coeffs: &[&[Self::Scalar]],
+        bases: &[&[Self]],
+    ) -> Vec<Self::Curve> {
+        use rayon::prelude::*;
+        coeffs
+            .par_iter()
+            .zip(bases.par_iter())
+            .map(|(c, b)| Self::msm_gpu_dispatch(c, b))
+            .collect()
+    }
 }
 
 // ── GPU-accelerated: BN254 G1 ──────────────────────────────────────────────
@@ -406,6 +435,13 @@ pub trait GpuMsm: CurveAffine {
 impl GpuMsm for G1Affine {
     fn msm_gpu_dispatch(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
         msm_gpu_bn254(coeffs, bases)
+    }
+
+    fn batch_msm_gpu_dispatch(
+        coeffs: &[&[Fr]],
+        bases: &[&[G1Affine]],
+    ) -> Vec<G1> {
+        batch_msm_gpu_bn254(coeffs, bases)
     }
 }
 
@@ -442,6 +478,355 @@ impl_gpu_msm_fallback!(crate::t256::T256Affine);
 /// GPU-accelerated MSM for BN254 G1 (concrete implementation).
 fn msm_gpu_bn254(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
     msm_gpu_inner(coeffs, bases, false).0
+}
+
+/// Batch GPU MSM for BN254 G1.
+///
+/// Optimized for the case where multiple MSMs share the same bases (typical in
+/// Nova IVC batch commits). Reuses:
+/// - Metal GPU context and compiled pipelines (always shared via `gpu_ctx()`)
+/// - Bases GPU buffer (single memcpy when bases are shared)
+/// - Booth index cache (single allocation)
+/// - Working buffers (acquire once, reuse per task)
+fn batch_msm_gpu_bn254(all_coeffs: &[&[Fr]], all_bases: &[&[G1Affine]]) -> Vec<G1> {
+    use ff::PrimeField;
+    use rayon::prelude::*;
+
+    assert_eq!(all_coeffs.len(), all_bases.len());
+    if all_coeffs.is_empty() {
+        return Vec::new();
+    }
+
+    let batch_size = all_coeffs.len();
+
+    // Detect shared bases (pointer equality)
+    let shared = batch_size > 1
+        && all_bases.iter().all(|b| {
+            core::ptr::eq(b.as_ptr(), all_bases[0].as_ptr()) && b.len() == all_bases[0].len()
+        });
+
+    let n = all_bases[0].len();
+
+    // Fall back to CPU for small inputs
+    if n < (1 << 14) {
+        return crate::msm::batch_msm_best(all_coeffs, all_bases);
+    }
+
+    let ctx = gpu_ctx();
+    let c = get_optimal_c_gpu(n);
+    let num_buckets = 1usize << (c - 1);
+    let num_bits = Fr::NUM_BITS as usize;
+    let number_of_windows = num_bits / c + 1;
+
+    assert_eq!(
+        std::mem::size_of::<G1Affine>(),
+        64,
+        "G1Affine must be 64 bytes for zero-copy GPU transfer"
+    );
+    let bases_byte_len = n * std::mem::size_of::<G1Affine>();
+
+    // ── Shared resources: acquire once ──────────────────────────────────────
+
+    // Bases buffer: acquire once, copy once if shared
+    let bases_buf = ctx.acquire_buffer(bases_byte_len as u64);
+    if shared {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                all_bases[0].as_ptr() as *const u8,
+                bases_buf.contents() as *mut u8,
+                bases_byte_len,
+            );
+        }
+    }
+
+    // Booth index cache: take once, reuse for each task
+    let booth_len = number_of_windows * n;
+    let mut booth = {
+        let mut cached = BOOTH_CACHE.lock().unwrap();
+        if cached.capacity() >= booth_len {
+            let mut b = std::mem::take(&mut *cached);
+            unsafe { b.set_len(booth_len); }
+            b
+        } else {
+            drop(cached);
+            vec![0i32; booth_len]
+        }
+    };
+
+    // Working buffers: estimate max sizes and acquire once
+    // (scatter size varies per task, but we allocate for worst case)
+    let max_scatter_entries = number_of_windows * n; // worst case: all scalars non-zero
+    let scatter_buf_bytes = (max_scatter_entries.max(1) * 4) as u64;
+    let offsets_buf_bytes = (number_of_windows * (num_buckets + 1) * 4) as u64;
+    let buckets_buf_bytes = (number_of_windows * num_buckets * 24 * 4) as u64;
+    let params_buf_bytes = (number_of_windows * 3 * 4) as u64;
+    let use_pbpr = num_buckets >= 256;
+    let num_reduce_threads = if use_pbpr {
+        let max_tg = ctx
+            .bucket_reduce_stage1_all_pipeline
+            .max_total_threads_per_threadgroup() as usize;
+        let ideal = (num_buckets / 64).max(2).min(max_tg);
+        let mut t = 1;
+        while t * 2 <= ideal && num_buckets % (t * 2) == 0 {
+            t *= 2;
+        }
+        t
+    } else {
+        0
+    };
+    let g_points_bytes = if use_pbpr {
+        (number_of_windows * num_reduce_threads * 24 * 4) as u64
+    } else {
+        0
+    };
+
+    let scatter_buf = ctx.acquire_buffer(scatter_buf_bytes);
+    let offsets_buf = ctx.acquire_buffer(offsets_buf_bytes);
+    let buckets_buf = ctx.acquire_buffer(buckets_buf_bytes);
+    let window_params_buf = ctx.acquire_buffer(params_buf_bytes);
+    let g_points_buf = if use_pbpr {
+        Some(ctx.acquire_buffer(g_points_bytes))
+    } else {
+        None
+    };
+    let reduce_params_buf = if use_pbpr {
+        Some(ctx.acquire_buffer(8))
+    } else {
+        None
+    };
+
+    // ── Per-task loop ───────────────────────────────────────────────────────
+
+    let mut results = Vec::with_capacity(batch_size);
+
+    for task_idx in 0..batch_size {
+        let coeffs = all_coeffs[task_idx];
+        let task_bases = all_bases[task_idx];
+        assert_eq!(coeffs.len(), task_bases.len());
+
+        // If bases differ per task, re-copy
+        if !shared {
+            assert_eq!(task_bases.len(), n, "batch tasks must have same base length");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    task_bases.as_ptr() as *const u8,
+                    bases_buf.contents() as *mut u8,
+                    bases_byte_len,
+                );
+            }
+        }
+
+        // 1. Fused scalar encode + scatter build (per-task, different coeffs)
+        let booth_addr = booth.as_mut_ptr() as usize;
+        coeffs.par_iter().enumerate().for_each(|(i, s)| {
+            let bytes = s.to_repr();
+            let ptr = booth_addr as *mut i32;
+            for w in 0..number_of_windows {
+                let idx = crate::msm::get_booth_index(w, c, bytes.as_ref());
+                unsafe { *ptr.add(w * n + i) = idx as i32; }
+            }
+        });
+
+        let scatter_tables: Vec<_> = (0..number_of_windows)
+            .into_par_iter()
+            .map(|w| {
+                let booth_slice = &booth[w * n..(w + 1) * n];
+                let mut counts = vec![0u32; num_buckets];
+                for &idx in booth_slice {
+                    if idx != 0 {
+                        counts[idx.unsigned_abs() as usize - 1] += 1;
+                    }
+                }
+                let mut bucket_offsets = vec![0u32; num_buckets + 1];
+                for b in 0..num_buckets {
+                    bucket_offsets[b + 1] = bucket_offsets[b] + counts[b];
+                }
+                let total = bucket_offsets[num_buckets] as usize;
+                let mut scatter_entries = vec![0u32; total];
+                let mut write_pos = bucket_offsets[..num_buckets].to_vec();
+                for (i, &idx) in booth_slice.iter().enumerate() {
+                    if idx != 0 {
+                        let sign = (idx > 0) as u32;
+                        let buck = idx.unsigned_abs() as usize - 1;
+                        let pos = write_pos[buck] as usize;
+                        scatter_entries[pos] = (i as u32) | (sign << 31);
+                        write_pos[buck] += 1;
+                    }
+                }
+                (bucket_offsets, scatter_entries)
+            })
+            .collect();
+
+        // 2. Build concatenated GPU buffers
+        let mut active_windows: Vec<usize> = Vec::new();
+        let mut total_scatter_entries = 0usize;
+        for w in 0..number_of_windows {
+            if !scatter_tables[w].1.is_empty() {
+                active_windows.push(w);
+                total_scatter_entries += scatter_tables[w].1.len();
+            }
+        }
+        let num_active = active_windows.len();
+
+        let scatter_dst = scatter_buf.contents() as *mut u32;
+        let offsets_dst = offsets_buf.contents() as *mut u32;
+        let params_dst = window_params_buf.contents() as *mut u32;
+
+        let mut scatter_cursor = 0u32;
+        for (i, &w) in active_windows.iter().enumerate() {
+            let (ref offsets, ref entries) = scatter_tables[w];
+            let offsets_start = (i * (num_buckets + 1)) as u32;
+            let buckets_start = (i * num_buckets) as u32;
+
+            unsafe {
+                *params_dst.add(i * 3) = scatter_cursor;
+                *params_dst.add(i * 3 + 1) = offsets_start;
+                *params_dst.add(i * 3 + 2) = buckets_start;
+
+                std::ptr::copy_nonoverlapping(
+                    offsets.as_ptr(),
+                    offsets_dst.add(i * (num_buckets + 1)),
+                    num_buckets + 1,
+                );
+                std::ptr::copy_nonoverlapping(
+                    entries.as_ptr(),
+                    scatter_dst.add(scatter_cursor as usize),
+                    entries.len(),
+                );
+            }
+            scatter_cursor += entries.len() as u32;
+        }
+
+        // 3. GPU dispatch (reuses all buffers)
+        let mut window_results: Vec<(usize, G1)> = Vec::with_capacity(num_active);
+
+        if num_active > 0 {
+            let cb = ctx.queue.new_command_buffer();
+
+            // Bucket accumulation
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&ctx.bucket_accumulate_all_pipeline);
+            enc.set_buffer(0, Some(&bases_buf), 0);
+            enc.set_buffer(1, Some(&scatter_buf), 0);
+            enc.set_buffer(2, Some(&offsets_buf), 0);
+            enc.set_buffer(3, Some(&buckets_buf), 0);
+            enc.set_buffer(4, Some(&window_params_buf), 0);
+            let max_tg = ctx
+                .bucket_accumulate_all_pipeline
+                .max_total_threads_per_threadgroup() as u64;
+            let grid = MTLSize::new(num_buckets as u64, num_active as u64, 1);
+            let tg = MTLSize::new(max_tg.min(num_buckets as u64), 1, 1);
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+
+            if use_pbpr {
+                let gpb = g_points_buf.as_ref().unwrap();
+                let rpb = reduce_params_buf.as_ref().unwrap();
+                unsafe {
+                    let p = rpb.contents() as *mut u32;
+                    *p = num_buckets as u32;
+                    *p.add(1) = num_reduce_threads as u32;
+                }
+
+                // PBPR Stage 1
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage1_all_pipeline);
+                enc.set_buffer(0, Some(&buckets_buf), 0);
+                enc.set_buffer(1, Some(gpb), 0);
+                enc.set_buffer(2, Some(rpb), 0);
+                let max_tg = ctx
+                    .bucket_reduce_stage1_all_pipeline
+                    .max_total_threads_per_threadgroup() as u64;
+                let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
+                let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+
+                // PBPR Stage 2
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&ctx.bucket_reduce_stage2_all_pipeline);
+                enc.set_buffer(0, Some(&buckets_buf), 0);
+                enc.set_buffer(1, Some(gpb), 0);
+                enc.set_buffer(2, Some(rpb), 0);
+                let max_tg = ctx
+                    .bucket_reduce_stage2_all_pipeline
+                    .max_total_threads_per_threadgroup() as u64;
+                let grid = MTLSize::new(num_reduce_threads as u64, num_active as u64, 1);
+                let tg = MTLSize::new(max_tg.min(num_reduce_threads as u64), 1, 1);
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+            }
+
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // 4. Read back results
+        if use_pbpr && num_active > 0 {
+            let gpb = g_points_buf.as_ref().unwrap();
+            let g_ptr = gpb.contents() as *const u64;
+            for (i, &w) in active_windows.iter().enumerate() {
+                let mut window_sum = G1::identity();
+                for t in 0..num_reduce_threads {
+                    let off = (i * num_reduce_threads + t) * 12;
+                    if let Some(g_point) = unsafe { read_jacobian_point(g_ptr, off) } {
+                        window_sum = window_sum + g_point;
+                    }
+                }
+                window_results.push((w, window_sum));
+            }
+        } else {
+            let bucket_ptr = buckets_buf.contents() as *const u64;
+            for (i, &w) in active_windows.iter().enumerate() {
+                let base_off = i * num_buckets * 12;
+                let mut running = G1::identity();
+                let mut window_sum = G1::identity();
+                for b in (0..num_buckets).rev() {
+                    let off = base_off + b * 12;
+                    if let Some(bucket_point) = unsafe { read_jacobian_point(bucket_ptr, off) } {
+                        running = running + bucket_point;
+                    }
+                    window_sum = window_sum + running;
+                }
+                window_results.push((w, window_sum));
+            }
+        }
+
+        // 5. Horner's method to combine windows
+        let mut window_map: Vec<Option<G1>> = vec![None; number_of_windows];
+        for (w, pt) in window_results {
+            window_map[w] = Some(pt);
+        }
+        let mut total_acc = G1::identity();
+        for w in (0..number_of_windows).rev() {
+            for _ in 0..c {
+                total_acc = total_acc.double();
+            }
+            if let Some(pt) = window_map[w].take() {
+                total_acc = total_acc + pt;
+            }
+        }
+
+        results.push(total_acc);
+    }
+
+    // ── Cleanup: return all shared resources ────────────────────────────────
+
+    {
+        let mut cached = BOOTH_CACHE.lock().unwrap();
+        *cached = booth;
+    }
+
+    let mut bufs = vec![bases_buf, scatter_buf, offsets_buf, buckets_buf, window_params_buf];
+    if let Some(b) = g_points_buf {
+        bufs.push(b);
+    }
+    if let Some(b) = reduce_params_buf {
+        bufs.push(b);
+    }
+    ctx.release_buffers(bufs);
+
+    results
 }
 
 /// GPU MSM with detailed phase timing breakdown.
@@ -515,9 +900,9 @@ pub fn msm_gpu_warmup(n: usize) {
     // 3. Pre-allocate booth index cache
     {
         let booth_len = number_of_windows * n;
-        let mut booth = vec![0i16; booth_len];
+        let mut booth = vec![0i32; booth_len];
         // Touch all pages
-        for offset in (0..booth_len).step_by(2048) { // 2048 i16 = 4KB
+        for offset in (0..booth_len).step_by(1024) { // 1024 i32 = 4KB
             booth[offset] = 0;
         }
         let mut cached = BOOTH_CACHE.lock().unwrap();
@@ -612,7 +997,7 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
     // Instead of separate encode and scatter phases, we fuse them:
     // 1. Compute to_repr() once per scalar (in parallel)
     // 2. Extract ALL windows' Booth indices from the repr
-    // 3. Store as column-major i16 booth[window][scalar] for sequential scatter access
+    // 3. Store as column-major i32 booth[window][scalar] for sequential scatter access
     //
     // This eliminates the 512MB intermediate coeffs_bytes allocation.
     let t0 = Instant::now();
@@ -628,18 +1013,18 @@ fn msm_gpu_inner(coeffs: &[Fr], bases: &[G1Affine], timed: bool) -> (G1, GpuMsmT
         } else {
             drop(cached);
             // First call or size grew: allocate fresh (this pays the page-fault cost once)
-            vec![0i16; booth_len]
+            vec![0i32; booth_len]
         }
     };
     let booth_addr = booth.as_mut_ptr() as usize;
 
     coeffs.par_iter().enumerate().for_each(|(i, s)| {
         let bytes = s.to_repr();
-        let ptr = booth_addr as *mut i16;
+        let ptr = booth_addr as *mut i32;
         for w in 0..number_of_windows {
             let idx = get_booth_index(w, c, bytes.as_ref());
             // SAFETY: each scalar i writes to distinct positions [w*n + i].
-            unsafe { *ptr.add(w * n + i) = idx as i16; }
+            unsafe { *ptr.add(w * n + i) = idx as i32; }
         }
     });
     if timed { timing.scalar_encode_ms = t0.elapsed().as_secs_f64() * 1000.0; }
@@ -1025,20 +1410,20 @@ pub fn msm_gpu_glv(coeffs: &[Fr], bases: &[G1Affine]) -> G1 {
             // Each entry stores (booth_index, effective_sign, base_index) packed as:
             //   booth1[w * n + i] = signed booth index for k1 scalar i at window w
             //   booth2[w * n + i] = signed booth index for k2 scalar i at window w
-            let mut booth1 = vec![0i16; number_of_windows * n];
-            let mut booth2 = vec![0i16; number_of_windows * n];
+            let mut booth1 = vec![0i32; number_of_windows * n];
+            let mut booth2 = vec![0i32; number_of_windows * n];
             let booth1_addr = booth1.as_mut_ptr() as usize;
             let booth2_addr = booth2.as_mut_ptr() as usize;
 
             // Parallel precompute: each scalar computes all its window indices
             (0..n).into_par_iter().for_each(|i| {
-                let p1 = booth1_addr as *mut i16;
-                let p2 = booth2_addr as *mut i16;
+                let p1 = booth1_addr as *mut i32;
+                let p2 = booth2_addr as *mut i32;
                 for w in 0..number_of_windows {
                     // SAFETY: each scalar i writes to distinct positions [w*n + i]
                     unsafe {
-                        *p1.add(w * n + i) = get_booth_index(w, c, &k1_bytes[i]) as i16;
-                        *p2.add(w * n + i) = get_booth_index(w, c, &k2_bytes[i]) as i16;
+                        *p1.add(w * n + i) = get_booth_index(w, c, &k1_bytes[i]) as i32;
+                        *p2.add(w * n + i) = get_booth_index(w, c, &k2_bytes[i]) as i32;
                     }
                 }
             });

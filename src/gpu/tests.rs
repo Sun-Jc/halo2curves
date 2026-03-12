@@ -800,3 +800,64 @@ fn test_msm_gpu_glv_timing() {
         eprintln!("k={k:2} | n={n:>10} | glv median={median:.1}ms mean={mean:.1}ms | all: {:.1?}", times);
     }
 }
+
+// ── Batch GPU MSM tests ─────────────────────────────────────────────────
+
+/// Test that batch_msm_gpu with shared bases matches per-task msm_gpu.
+#[test]
+fn test_batch_msm_gpu_shared_bases() {
+    let k = 14;
+    let n = 1 << k;
+    let batch_size = 5;
+
+    let pts: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+    let mut points = vec![G1Affine::identity(); n];
+    G1::batch_normalize(&pts, &mut points);
+
+    let all_scalars: Vec<Vec<Fr>> = (0..batch_size)
+        .map(|_| (0..n).map(|_| Fr::random(OsRng)).collect())
+        .collect();
+
+    // Reference: per-task msm_gpu
+    let expected: Vec<G1> = all_scalars
+        .iter()
+        .map(|s| crate::gpu::msm_gpu::<G1Affine>(s, &points))
+        .collect();
+
+    // Batch with shared bases
+    let coeffs_refs: Vec<&[Fr]> = all_scalars.iter().map(|s| s.as_slice()).collect();
+    let bases_refs: Vec<&[G1Affine]> = vec![points.as_slice(); batch_size];
+    let actual = crate::gpu::batch_msm_gpu::<G1Affine>(&coeffs_refs, &bases_refs);
+
+    assert_eq!(expected, actual, "batch_msm_gpu (shared bases) mismatch");
+}
+
+/// Test batch_msm_gpu with single task (should behave like msm_gpu).
+#[test]
+fn test_batch_msm_gpu_single_task() {
+    let k = 14;
+    let n = 1 << k;
+
+    let pts: Vec<G1> = (0..n).map(|_| G1::random(OsRng)).collect();
+    let mut points = vec![G1Affine::identity(); n];
+    G1::batch_normalize(&pts, &mut points);
+
+    let scalars: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+
+    let expected = crate::gpu::msm_gpu::<G1Affine>(&scalars, &points);
+
+    let coeffs_refs: Vec<&[Fr]> = vec![scalars.as_slice()];
+    let bases_refs: Vec<&[G1Affine]> = vec![points.as_slice()];
+    let actual = crate::gpu::batch_msm_gpu::<G1Affine>(&coeffs_refs, &bases_refs);
+
+    assert_eq!(vec![expected], actual, "batch_msm_gpu (single task) mismatch");
+}
+
+/// Test batch_msm_gpu with empty input.
+#[test]
+fn test_batch_msm_gpu_empty() {
+    let coeffs: Vec<&[Fr]> = vec![];
+    let bases: Vec<&[G1Affine]> = vec![];
+    let result = crate::gpu::batch_msm_gpu::<G1Affine>(&coeffs, &bases);
+    assert!(result.is_empty());
+}
