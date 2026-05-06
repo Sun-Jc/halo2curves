@@ -575,7 +575,18 @@ pub(crate) fn impl_field(input: TokenStream) -> TokenStream {
         }
     };
     #[cfg(not(feature = "asm"))]
-    let impl_arith = arith::impl_arith(&field, num_limbs, inv64);
+    let impl_arith = {
+        // When the modulus uses fewer than `num_limbs * 64` bits, a + b
+        // cannot overflow the high limb, and we can emit a shorter add path
+        // (no carry combine). This matches all common cryptographic primes
+        // (BN254 Fr/Fq, BLS12-381 Fr/Fq, Pallas/Vesta, Goldilocks, etc.).
+        let total_bits = (num_limbs as u32) * 64;
+        if num_bits < total_bits {
+            arith::impl_arith_capacity_lt_limbs(&field, num_limbs, inv64)
+        } else {
+            arith::impl_arith(&field, num_limbs, inv64)
+        }
+    };
 
     let impl_arith_always_const = arith::impl_arith_always_const(&field, num_limbs, inv64);
 
@@ -620,7 +631,26 @@ pub(crate) fn impl_field(input: TokenStream) -> TokenStream {
         }
     };
 
+    let modulus_static_ident = quote::format_ident!("__MODULUS_LIMBS_S_{}", field);
+
     let output = quote! {
+        // Static mirror of the modulus limbs. Forces LLVM to emit
+        // `adrp + ldr` data-segment loads (2 instructions per limb)
+        // rather than materializing each limb as a `mov + 3 × movk`
+        // immediate chain (4 instructions per limb). The fast-path
+        // add/sub use this through `#field::modulus_static_ref()`.
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        pub static #modulus_static_ident: [u64; #num_limbs] = #modulus_limbs_ident;
+
+        impl #field {
+            #[doc(hidden)]
+            #[inline(always)]
+            pub(crate) fn modulus_static_ref() -> &'static [u64; #num_limbs] {
+                &#modulus_static_ident
+            }
+        }
+
         #impl_arith
         #impl_arith_always_const
         #impl_field
